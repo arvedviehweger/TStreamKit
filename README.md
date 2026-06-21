@@ -91,14 +91,23 @@ app's `Info.plist`:
 Loopback (127.0.0.1) connections do **not** trigger the iOS Local Network
 permission prompt.
 
-## Codec support (v1.0)
+## Codec support
 
 | | Supported | Notes |
 |---|---|---|
-| Video | **H.264** | H.265/HEVC is detected and reported as unsupported |
-| Audio | **AAC** (ADTS) | AC-3 is detected and reported as unsupported |
+| Video | **H.264** (avc1), **H.265 / HEVC** (hvc1) | HEVC decodes in hardware on iOS 11+; common for HD/UHD broadcast |
+| Audio | **AAC** (ADTS), **AC-3** (Dolby Digital) | AC-3 needs a real device — the iOS Simulator often lacks the decoder |
 
-Out of scope for v1.0: AES-128 encrypted streams, multi-language audio,
+All codecs are **passed through** untouched — TStreamKit never transcodes; the
+iOS decoders do the work, so a codec is only listed here if AVFoundation can
+play it from fMP4.
+
+> **MP2 (MPEG-1/2 Layer II audio) is not supported.** AVFoundation cannot decode
+> it, so it cannot be passed through — that would require a bundled software
+> decoder plus an AAC re-encode. MP2 audio streams are ignored (video still
+> plays).
+
+Out of scope: AES-128 encrypted streams, multi-language audio,
 subtitles/teletext, timeshift/recording, UDP/RTP multicast.
 
 ## Architecture
@@ -110,20 +119,21 @@ subtitles/teletext, timeshift/recording, UDP/RTP multicast.
 | `HLSStore` | Thread-safe init segment + sliding window of segments; renders master/media playlists |
 | `HLSLocalServer` | Loopback HTTP/1.1 server (`NWListener`) serving the playlists + segments |
 | `TSPacketParser` | 188-byte packet framing, sync, resync |
-| `TSDemuxer` | PAT/PMT resolution, PES reassembly, PTS/DTS, AVCC/AAC extraction |
-| `FMP4Muxer` / `MP4Box` | ISO BMFF box writer; init segment + per-GOP HLS media segments (styp + sidx + moof + mdat) |
+| `TSDemuxer` | PAT/PMT resolution, PES reassembly, PTS/DTS, per-codec access-unit extraction |
+| `H264` / `HEVC` / `ADTS` / `AC3` | Elementary-stream parsers: NAL/sync-frame framing, parameter sets, decoder configs |
+| `FMP4Muxer` / `MP4Box` | ISO BMFF box writer; init segment (avc1/hvc1, mp4a/ac-3) + per-GOP HLS media segments (styp + sidx + moof + mdat) |
 | `TStreamError` | Typed error surface |
 
 ## Status & validation
 
-The component pipeline (packet parsing, PAT/PMT/PES demux, NAL/AVCC
-conversion, ADTS framing, fMP4 box structure) plus full-path HLS playback are
-covered by `swift test` (17 tests, incl. a real `AVPlayer` consuming the local
-HLS server). Startup latency is roughly the buffer-ahead count (3 segments)
-times the source GOP length; A/V are muxed into the same segments.
+The component pipeline (packet parsing, PAT/PMT/PES demux, H.264/HEVC NAL
+conversion, ADTS/AC-3 framing, fMP4 box structure) plus full-path HLS playback
+are covered by `swift test` (23 tests, incl. a real `AVPlayer` consuming the
+local HLS server). Startup latency is roughly the buffer-ahead count (3
+segments) times the source GOP length; A/V are muxed into the same segments.
 
-Remaining nice-to-haves: tune segment/window sizing for lower latency, optional
-H.265/AC-3, and validation on a physical device.
+Remaining nice-to-haves: tune segment/window sizing for lower latency, and
+validation of HEVC/AC-3 on a physical device.
 
 ## License
 
