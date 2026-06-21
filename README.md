@@ -40,7 +40,7 @@ AVPlayer
 Swift Package Manager:
 
 ```swift
-.package(url: "https://github.com/<you>/TStreamKit.git", from: "1.0.0")
+.package(url: "https://github.com/arvedviehweger/TStreamKit.git", from: "1.0.0")
 ```
 
 ## Usage
@@ -116,8 +116,7 @@ subtitles/teletext, timeshift/recording, UDP/RTP multicast.
 
 ## Status & validation
 
-Verified end-to-end **playing a 1× live MPEG-TS stream on the iOS Simulator**
-(Xcode 26). The component pipeline (packet parsing, PAT/PMT/PES demux, NAL/AVCC
+The component pipeline (packet parsing, PAT/PMT/PES demux, NAL/AVCC
 conversion, ADTS framing, fMP4 box structure) plus full-path HLS playback are
 covered by `swift test` (17 tests, incl. a real `AVPlayer` consuming the local
 HLS server). Startup latency is roughly the buffer-ahead count (3 segments)
