@@ -4,12 +4,15 @@ import XCTest
 final class fMP4MuxerTests: XCTestCase {
     private func makeMuxer(withAudio: Bool = true) -> FMP4Muxer {
         let video = VideoFormat(codec: .h264,
+                                vps: Data(),
                                 sps: Data([0x67, 0x42, 0x00, 0x1F, 0x96]),
                                 pps: Data([0x68, 0xCE, 0x3C, 0x80]),
-                                width: 1280, height: 720)
+                                width: 1280, height: 720,
+                                codecParameters: "avc1.42001f",
+                                hevc: nil)
         let audio = withAudio
             ? AudioFormat(codec: .aac, sampleRate: 44100, channels: 2,
-                          audioSpecificConfig: Data([0x12, 0x10]))
+                          samplesPerFrame: 1024, decoderConfig: Data([0x12, 0x10]))
             : nil
         return FMP4Muxer(video: video, audio: audio)
     }
