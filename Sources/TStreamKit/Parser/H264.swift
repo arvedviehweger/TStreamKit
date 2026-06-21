@@ -185,6 +185,14 @@ struct BitReader {
         return value
     }
 
+    /// Advances past `count` bits, returning false if the buffer is too short.
+    @discardableResult
+    mutating func skip(_ count: Int) -> Bool {
+        guard bitsRemaining >= count else { return false }
+        bitPos += count
+        return true
+    }
+
     /// Unsigned Exp-Golomb.
     mutating func readUE() -> UInt32? {
         var leadingZeros = 0
