@@ -105,12 +105,12 @@ final class TStreamPipeline: NSObject {
     }
 
     private func codecsString(video: VideoFormat, audio: AudioFormat?) -> String {
-        let sps = [UInt8](video.sps)
-        let avc = sps.count >= 4
-            ? String(format: "avc1.%02x%02x%02x", sps[1], sps[2], sps[3])
-            : "avc1.640028"
-        var codecs = [avc]
-        if audio != nil { codecs.append("mp4a.40.2") } // AAC-LC
+        var codecs = [video.codecParameters]
+        switch audio?.codec {
+        case .aac: codecs.append("mp4a.40.2") // AAC-LC
+        case .ac3: codecs.append("ac-3")
+        case .none: break
+        }
         return codecs.joined(separator: ",")
     }
 

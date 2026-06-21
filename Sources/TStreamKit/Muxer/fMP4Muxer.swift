@@ -85,7 +85,7 @@ final class FMP4Muxer {
         if videoTicks > 0 {
             duration = Double(videoTicks) / Double(videoTimescale)
         } else {
-            duration = Double(audioSamples.count) * 1024.0 / Double(audioTimescale)
+            duration = Double(audioSamples.count) * Double(audio?.samplesPerFrame ?? 1024) / Double(audioTimescale)
         }
         onSegment?(fragment, duration)
     }
@@ -109,7 +109,8 @@ final class FMP4Muxer {
     }
 
     private func makeAudioSamples(_ units: [AccessUnit]) -> [Sample] {
-        units.map { Sample(data: $0.data, duration: 1024, flags: 0x0200_0000) }
+        let duration = UInt32(audio?.samplesPerFrame ?? 1024)
+        return units.map { Sample(data: $0.data, duration: duration, flags: 0x0200_0000) }
     }
 
     // MARK: - Initialization segment
@@ -122,7 +123,8 @@ final class FMP4Muxer {
         var w = ByteWriter()
         w.fourCC("iso5")        // major brand
         w.u32(0x0000_0200)      // minor version
-        w.fourCC("iso5"); w.fourCC("iso6"); w.fourCC("mp41"); w.fourCC("avc1")
+        w.fourCC("iso5"); w.fourCC("iso6"); w.fourCC("mp41")
+        w.fourCC(video.codec == .h265 ? "hvc1" : "avc1")
         return MP4Box.box("ftyp", w.data)
     }
 
@@ -175,7 +177,7 @@ final class FMP4Muxer {
                 MP4Box.box("minf", MP4Box.concat([
                     vmhd(), dinf(),
                     MP4Box.box("stbl", MP4Box.concat([
-                        MP4Box.box("stsd", stsdBody(sampleEntry: avc1())),
+                        MP4Box.box("stsd", stsdBody(sampleEntry: videoSampleEntry())),
                         emptyFullBox("stts"), emptyFullBox("stsc"),
                         stsz(), emptyFullBox("stco"),
                     ])),
@@ -184,7 +186,9 @@ final class FMP4Muxer {
         ]))
     }
 
-    private func avc1() -> Data {
+    /// `avc1`/`avcC` for H.264, `hvc1`/`hvcC` for HEVC.
+    private func videoSampleEntry() -> Data {
+        let (type, config) = video.codec == .h265 ? ("hvc1", hvcC()) : ("avc1", avcC())
         var w = ByteWriter()
         for _ in 0..<6 { w.u8(0) }       // reserved
         w.u16(1)                          // data_reference_index
@@ -197,8 +201,8 @@ final class FMP4Muxer {
         w.bytes(compressorName(""))       // 32-byte compressor name
         w.u16(0x0018)                     // depth
         w.i16(-1)                         // pre_defined
-        w.append(avcC())
-        return MP4Box.box("avc1", w.data)
+        w.append(config)
+        return MP4Box.box(type, w.data)
     }
 
     private func avcC() -> Data {
@@ -217,6 +221,37 @@ final class FMP4Muxer {
         return MP4Box.box("avcC", w.data)
     }
 
+    /// HEVCDecoderConfigurationRecord (ISO/IEC 14496-15) with VPS/SPS/PPS arrays.
+    private func hvcC() -> Data {
+        guard let info = video.hevc else { return Data() }
+        let vps = [UInt8](video.vps)
+        let sps = [UInt8](video.sps)
+        let pps = [UInt8](video.pps)
+
+        var w = ByteWriter()
+        w.u8(1)                                   // configurationVersion
+        w.bytes(info.generalProfileTierLevel)     // profile_space … level_idc (12 bytes)
+        w.u16(0xF000)                             // reserved | min_spatial_segmentation_idc=0
+        w.u8(0xFC)                                // reserved | parallelismType=0
+        w.u8(0xFC | (info.chromaFormat & 0x03))   // reserved | chromaFormat
+        w.u8(0xF8 | (info.bitDepthLumaMinus8 & 0x07))
+        w.u8(0xF8 | (info.bitDepthChromaMinus8 & 0x07))
+        w.u16(0)                                  // avgFrameRate
+        // constantFrameRate(2)=0 | numTemporalLayers(3) | temporalIdNested(1) | lengthSizeMinusOne(2)=3
+        w.u8(((info.numTemporalLayers & 0x07) << 3) | ((info.temporalIdNested & 0x01) << 2) | 0x03)
+        w.u8(3)                                   // numOfArrays: VPS, SPS, PPS
+
+        func array(type: UInt8, nalu: [UInt8]) {
+            w.u8(type & 0x3F)                     // array_completeness=0 | NAL_unit_type
+            w.u16(1)                              // numNalus
+            w.u16(UInt16(nalu.count)); w.bytes(nalu)
+        }
+        array(type: HEVC.NALType.vps, nalu: vps)
+        array(type: HEVC.NALType.sps, nalu: sps)
+        array(type: HEVC.NALType.pps, nalu: pps)
+        return MP4Box.box("hvcC", w.data)
+    }
+
     // MARK: Audio track
 
     private func audioTrak() -> Data {
@@ -229,7 +264,7 @@ final class FMP4Muxer {
                 MP4Box.box("minf", MP4Box.concat([
                     smhd(), dinf(),
                     MP4Box.box("stbl", MP4Box.concat([
-                        MP4Box.box("stsd", stsdBody(sampleEntry: mp4a(audio))),
+                        MP4Box.box("stsd", stsdBody(sampleEntry: audioSampleEntry(audio))),
                         emptyFullBox("stts"), emptyFullBox("stsc"),
                         stsz(), emptyFullBox("stco"),
                     ])),
@@ -238,7 +273,9 @@ final class FMP4Muxer {
         ]))
     }
 
-    private func mp4a(_ audio: AudioFormat) -> Data {
+    /// `mp4a`/`esds` for AAC, `ac-3`/`dac3` for AC-3.
+    private func audioSampleEntry(_ audio: AudioFormat) -> Data {
+        let (type, config) = audio.codec == .ac3 ? ("ac-3", dac3(audio)) : ("mp4a", esds(audio))
         var w = ByteWriter()
         for _ in 0..<6 { w.u8(0) }              // reserved
         w.u16(1)                                 // data_reference_index
@@ -247,12 +284,17 @@ final class FMP4Muxer {
         w.u16(16)                                // sample size
         w.u16(0); w.u16(0)                       // pre_defined / reserved
         w.u32(UInt32(audio.sampleRate) << 16)    // sample rate 16.16
-        w.append(esds(audio))
-        return MP4Box.box("mp4a", w.data)
+        w.append(config)
+        return MP4Box.box(type, w.data)
+    }
+
+    /// AC3SpecificBox — the 3-byte payload is computed by the AC-3 parser.
+    private func dac3(_ audio: AudioFormat) -> Data {
+        MP4Box.box("dac3", audio.decoderConfig)
     }
 
     private func esds(_ audio: AudioFormat) -> Data {
-        let asc = [UInt8](audio.audioSpecificConfig)
+        let asc = [UInt8](audio.decoderConfig)
 
         func descriptor(_ tag: UInt8, _ payload: [UInt8]) -> [UInt8] {
             [tag, UInt8(payload.count)] + payload

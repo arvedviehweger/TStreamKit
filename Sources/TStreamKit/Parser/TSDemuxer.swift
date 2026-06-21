@@ -6,10 +6,15 @@ enum AudioCodec: Sendable { case aac, ac3 }
 /// Decoder configuration for the video elementary stream.
 struct VideoFormat: Sendable {
     let codec: VideoCodec
+    let vps: Data           // empty for H.264
     let sps: Data
     let pps: Data
     let width: Int
     let height: Int
+    /// HLS `CODECS` attribute value (e.g. `avc1.640028` or `hvc1.1.6.L93.B0`).
+    let codecParameters: String
+    /// HEVC-only fields needed for the `hvcC` record; `nil` for H.264.
+    let hevc: HEVC.ParameterSetInfo?
 }
 
 /// Decoder configuration for the audio elementary stream.
@@ -17,7 +22,10 @@ struct AudioFormat: Sendable {
     let codec: AudioCodec
     let sampleRate: Int
     let channels: Int
-    let audioSpecificConfig: Data
+    /// PCM samples represented by one access unit (1024 AAC, 1536 AC-3).
+    let samplesPerFrame: Int
+    /// Codec decoder config: AudioSpecificConfig for AAC, `dac3` payload for AC-3.
+    let decoderConfig: Data
 }
 
 /// One decodable unit ready for muxing.
@@ -57,6 +65,7 @@ final class TSDemuxer {
     private var audioCodec: AudioCodec?
 
     private var didEmitVideoFormat = false
+    private var videoVPS: Data?
     private var videoSPS: Data?
     private var videoPPS: Data?
 
@@ -73,7 +82,7 @@ final class TSDemuxer {
         pmtPID = nil; videoPID = nil; audioPID = nil
         videoCodec = nil; audioCodec = nil
         didEmitVideoFormat = false
-        videoSPS = nil; videoPPS = nil
+        videoVPS = nil; videoSPS = nil; videoPPS = nil
         videoPES = PESAccumulator()
         audioPES = PESAccumulator()
     }
@@ -159,12 +168,6 @@ final class TSDemuxer {
             i += 5 + esInfoLength
         }
 
-        if videoCodec == .h265 {
-            delegate?.demuxer(self, didFail: .unsupportedCodec("HEVC/H.265 is not supported in v1.0"))
-        }
-        if audioCodec == .ac3 {
-            delegate?.demuxer(self, didFail: .unsupportedCodec("AC-3 is not supported in v1.0"))
-        }
         delegate?.demuxer(self, didIdentifyStreamsHasVideo: videoPID != nil, hasAudio: audioPID != nil)
     }
 
@@ -217,8 +220,16 @@ final class TSDemuxer {
     }
 
     private func completeVideoPES(_ bytes: [UInt8]) {
-        guard videoCodec == .h264, let header = parsePESHeader(bytes) else { return }
+        guard let header = parsePESHeader(bytes) else { return }
         let elementary = Array(bytes[header.payloadOffset...])
+        switch videoCodec {
+        case .h264: completeH264(elementary, header: header)
+        case .h265: completeH265(elementary, header: header)
+        case .none: break
+        }
+    }
+
+    private func completeH264(_ elementary: [UInt8], header: (pts: UInt64, dts: UInt64, payloadOffset: Int)) {
         let nals = H264.splitNALUnits(elementary)
         guard !nals.isEmpty else { return }
 
@@ -230,7 +241,7 @@ final class TSDemuxer {
                 videoPPS = Data(nal.bytes)
             }
         }
-        emitVideoFormatIfReady()
+        emitH264FormatIfReady()
 
         let sample = H264.avccSample(from: nals)
         guard !sample.data.isEmpty, didEmitVideoFormat else { return }
@@ -240,22 +251,75 @@ final class TSDemuxer {
                                                             isKeyframe: sample.isKeyframe))
     }
 
-    private func emitVideoFormatIfReady() {
+    private func emitH264FormatIfReady() {
         guard !didEmitVideoFormat, let sps = videoSPS, let pps = videoPPS else { return }
         let dims = H264.parseSPS([UInt8](sps)[...]) ?? H264.Dimensions(width: 1280, height: 720)
+        let b = [UInt8](sps)
+        let params = b.count >= 4
+            ? String(format: "avc1.%02x%02x%02x", b[1], b[2], b[3])
+            : "avc1.640028"
         didEmitVideoFormat = true
         delegate?.demuxer(self, didParseVideoFormat: VideoFormat(codec: .h264,
+                                                                vps: Data(),
                                                                 sps: sps,
                                                                 pps: pps,
                                                                 width: dims.width,
-                                                                height: dims.height))
+                                                                height: dims.height,
+                                                                codecParameters: params,
+                                                                hevc: nil))
+    }
+
+    private func completeH265(_ elementary: [UInt8], header: (pts: UInt64, dts: UInt64, payloadOffset: Int)) {
+        let nals = HEVC.splitNALUnits(elementary)
+        guard !nals.isEmpty else { return }
+
+        for nal in nals {
+            switch nal.type {
+            case HEVC.NALType.vps where videoVPS == nil: videoVPS = Data(nal.bytes)
+            case HEVC.NALType.sps where videoSPS == nil: videoSPS = Data(nal.bytes)
+            case HEVC.NALType.pps where videoPPS == nil: videoPPS = Data(nal.bytes)
+            default: break
+            }
+        }
+        emitH265FormatIfReady()
+
+        let sample = HEVC.sample(from: nals)
+        guard !sample.data.isEmpty, didEmitVideoFormat else { return }
+        delegate?.demuxer(self, didProduceVideo: AccessUnit(data: sample.data,
+                                                            pts: header.pts,
+                                                            dts: header.dts,
+                                                            isKeyframe: sample.isKeyframe))
+    }
+
+    private func emitH265FormatIfReady() {
+        guard !didEmitVideoFormat,
+              let vps = videoVPS, let sps = videoSPS, let pps = videoPPS,
+              let info = HEVC.parseSPS([UInt8](sps)[...]) else { return }
+        didEmitVideoFormat = true
+        delegate?.demuxer(self, didParseVideoFormat:
+            VideoFormat(codec: .h265,
+                        vps: vps,
+                        sps: sps,
+                        pps: pps,
+                        width: info.dimensions.width,
+                        height: info.dimensions.height,
+                        codecParameters: HEVC.codecParameters(generalProfileTierLevel: info.generalProfileTierLevel),
+                        hevc: info))
     }
 
     private var didEmitAudioFormat = false
 
     private func completeAudioPES(_ bytes: [UInt8]) {
-        guard audioCodec == .aac, let header = parsePESHeader(bytes) else { return }
+        guard let header = parsePESHeader(bytes) else { return }
         let elementary = Array(bytes[header.payloadOffset...])
+        switch audioCodec {
+        case .aac: completeAAC(elementary, header: header)
+        case .ac3: completeAC3(elementary, header: header)
+        case .none: break
+        }
+    }
+
+    private func completeAAC(_ elementary: [UInt8], header: (pts: UInt64, dts: UInt64, payloadOffset: Int)) {
         let frames = ADTS.frames(in: elementary)
         guard !frames.isEmpty else { return }
 
@@ -265,12 +329,37 @@ final class TSDemuxer {
             delegate?.demuxer(self, didParseAudioFormat: AudioFormat(codec: .aac,
                                                                     sampleRate: cfg.sampleRate,
                                                                     channels: cfg.channels,
-                                                                    audioSpecificConfig: cfg.audioSpecificConfig))
+                                                                    samplesPerFrame: 1024,
+                                                                    decoderConfig: cfg.audioSpecificConfig))
         }
 
         // Each AAC frame is 1024 samples; distribute PTS across frames in the PES.
         let sampleRate = ADTS.sampleRates[safe: frames[0].sampleRateIndex] ?? 44100
         let ticksPerFrame = UInt64(1024 * 90000 / max(sampleRate, 1))
+        for (index, frame) in frames.enumerated() {
+            let pts = header.pts + UInt64(index) * ticksPerFrame
+            delegate?.demuxer(self, didProduceAudio: AccessUnit(data: Data(frame.raw),
+                                                               pts: pts,
+                                                               dts: pts,
+                                                               isKeyframe: true))
+        }
+    }
+
+    private func completeAC3(_ elementary: [UInt8], header: (pts: UInt64, dts: UInt64, payloadOffset: Int)) {
+        let frames = AC3.frames(in: elementary)
+        guard !frames.isEmpty, let cfg = AC3.config(from: frames[0].raw) else { return }
+
+        if !didEmitAudioFormat {
+            didEmitAudioFormat = true
+            delegate?.demuxer(self, didParseAudioFormat: AudioFormat(codec: .ac3,
+                                                                    sampleRate: cfg.sampleRate,
+                                                                    channels: cfg.channels,
+                                                                    samplesPerFrame: AC3.samplesPerFrame,
+                                                                    decoderConfig: cfg.dac3))
+        }
+
+        // Each AC-3 sync frame is 1536 samples; distribute PTS across the PES.
+        let ticksPerFrame = UInt64(AC3.samplesPerFrame * 90000 / max(cfg.sampleRate, 1))
         for (index, frame) in frames.enumerated() {
             let pts = header.pts + UInt64(index) * ticksPerFrame
             delegate?.demuxer(self, didProduceAudio: AccessUnit(data: Data(frame.raw),
