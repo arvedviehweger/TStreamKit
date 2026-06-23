@@ -19,3 +19,11 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+---
+
+This MIT license covers the TStreamKit source code only. TStreamKit links
+FFmpeg (libavcodec, libavutil, libswscale, libavfilter), licensed under the GNU
+LGPL v3, and vendors the kjmp2 MPEG audio decoder (zlib license). See
+THIRD_PARTY_LICENSES.md for attribution and your obligations when distributing
+an application that embeds these components.
