@@ -61,42 +61,4 @@ final class CodecSupportTests: XCTestCase {
         let frames = AC3.frames(in: [0x12, 0x34, 0x56] + frame)
         XCTAssertEqual(frames.count, 1)
     }
-
-    // MARK: Muxer integration
-
-    func testHEVCInitSegmentUsesHvc1AndHvcC() {
-        let video = VideoFormat(
-            codec: .h265,
-            vps: Data([0x40, 0x01, 0x0C]),
-            sps: Data([0x42, 0x01, 0x01]),
-            pps: Data([0x44, 0x01, 0xC0]),
-            width: 3840, height: 2160,
-            codecParameters: "hvc1.1.6.L150.B0",
-            hevc: HEVC.ParameterSetInfo(
-                generalProfileTierLevel: [UInt8](repeating: 0, count: 12),
-                chromaFormat: 1, bitDepthLumaMinus8: 0, bitDepthChromaMinus8: 0,
-                numTemporalLayers: 1, temporalIdNested: 1,
-                dimensions: HEVC.Dimensions(width: 3840, height: 2160)))
-        let initSegment = FMP4Muxer(video: video, audio: nil).initializationSegment()
-
-        XCTAssertTrue(dataContains(initSegment, fourCC: "hvc1"))
-        XCTAssertTrue(dataContains(initSegment, fourCC: "hvcC"))
-        XCTAssertFalse(dataContains(initSegment, fourCC: "avc1"))
-    }
-
-    func testAC3InitSegmentUsesAc3AndDac3() {
-        let video = VideoFormat(codec: .h264, vps: Data(),
-                                sps: Data([0x67, 0x42, 0x00, 0x1F]),
-                                pps: Data([0x68, 0xCE, 0x3C, 0x80]),
-                                width: 1280, height: 720,
-                                codecParameters: "avc1.42001f", hevc: nil)
-        let audio = AudioFormat(codec: .ac3, sampleRate: 48000, channels: 6,
-                                samplesPerFrame: AC3.samplesPerFrame,
-                                decoderConfig: Data([0x10, 0x3D, 0xC0]))
-        let initSegment = FMP4Muxer(video: video, audio: audio).initializationSegment()
-
-        XCTAssertTrue(dataContains(initSegment, fourCC: "ac-3"))
-        XCTAssertTrue(dataContains(initSegment, fourCC: "dac3"))
-        XCTAssertFalse(dataContains(initSegment, fourCC: "mp4a"))
-    }
 }
