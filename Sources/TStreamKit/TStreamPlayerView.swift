@@ -24,8 +24,10 @@ public struct TStreamPlayerView: View {
     private let url: URL
     private let headers: [String: String]
     private let autoPlay: Bool
+    private var isPaused: Bool = false
     private var onError: ((TStreamError) -> Void)?
     private var onReady: (() -> Void)?
+    private var onProgress: ((TimeInterval) -> Void)?
 
     public init(url: URL, headers: [String: String] = [:], autoPlay: Bool = true) {
         self.url = url
@@ -47,8 +49,26 @@ public struct TStreamPlayerView: View {
         return copy
     }
 
+    /// Freeze (`true`) or resume (`false`) playback. Changes take effect once the
+    /// clock is running; toggling before that is a no-op.
+    public func paused(_ value: Bool) -> TStreamPlayerView {
+        var copy = self
+        copy.isPaused = value
+        return copy
+    }
+
+    /// Reports elapsed playback seconds (relative to the first frame) on the main
+    /// thread, ~4×/second while playing.
+    public func onProgress(_ handler: @escaping (TimeInterval) -> Void) -> TStreamPlayerView {
+        var copy = self
+        copy.onProgress = handler
+        return copy
+    }
+
     public var body: some View {
-        _TStreamPlayerContainer(url: url, headers: headers, autoPlay: autoPlay, onError: onError, onReady: onReady)
+        _TStreamPlayerContainer(url: url, headers: headers, autoPlay: autoPlay,
+                                isPaused: isPaused, onError: onError, onReady: onReady,
+                                onProgress: onProgress)
     }
 }
 
@@ -58,8 +78,10 @@ private struct _TStreamPlayerContainer: View {
     let url: URL
     let headers: [String: String]
     let autoPlay: Bool
+    let isPaused: Bool
     let onError: ((TStreamError) -> Void)?
     let onReady: (() -> Void)?
+    let onProgress: ((TimeInterval) -> Void)?
 
     @StateObject private var model = PlayerModel()
 
@@ -71,7 +93,12 @@ private struct _TStreamPlayerContainer: View {
             }
         }
         .onAppear {
-            model.configure(url: url, headers: headers, autoPlay: autoPlay, onError: onError, onReady: onReady)
+            model.configure(url: url, headers: headers, autoPlay: autoPlay,
+                            onError: onError, onReady: onReady, onProgress: onProgress)
+            model.setPaused(isPaused)
+        }
+        .onChange(of: isPaused) { paused in
+            model.setPaused(paused)
         }
         .onDisappear {
             model.teardown()
@@ -83,13 +110,19 @@ private final class PlayerModel: ObservableObject {
     @Published private(set) var player: TStreamSampleBufferPlayer?
 
     func configure(url: URL, headers: [String: String], autoPlay: Bool,
-                   onError: ((TStreamError) -> Void)?, onReady: (() -> Void)?) {
+                   onError: ((TStreamError) -> Void)?, onReady: (() -> Void)?,
+                   onProgress: ((TimeInterval) -> Void)?) {
         guard player == nil else { return }
         let player = TStreamSampleBufferPlayer(url: url, headers: headers)
         player.onError = onError
         player.onReadyToPlay = onReady
+        player.onProgress = onProgress
         self.player = player
         if autoPlay { player.play() }
+    }
+
+    func setPaused(_ paused: Bool) {
+        if paused { player?.pause() } else { player?.resume() }
     }
 
     func teardown() {

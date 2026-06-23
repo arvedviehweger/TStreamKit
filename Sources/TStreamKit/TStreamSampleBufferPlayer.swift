@@ -15,6 +15,9 @@ final class TStreamSampleBufferPlayer: NSObject {
 
     var onError: ((TStreamError) -> Void)?
     var onReadyToPlay: (() -> Void)?
+    /// Reports elapsed playback seconds (relative to the first frame) ~4×/sec
+    /// once the clock is running. Delivered on the main thread.
+    var onProgress: ((TimeInterval) -> Void)?
 
     private let synchronizer = AVSampleBufferRenderSynchronizer()
     private let audioRenderer = AVSampleBufferAudioRenderer()
@@ -33,6 +36,10 @@ final class TStreamSampleBufferPlayer: NSObject {
     private var audioQueue: [CMSampleBuffer] = []
 
     private var clockStarted = false
+    /// User-initiated pause (distinct from the backpressure source pause). While
+    /// set, the synchronizer rate is held at 0 so video *and* audio freeze.
+    private var userPaused = false
+    private var progressObserver: Any?
     private var firstVideoPTS: CMTime?
     private var latestVideoPTS: CMTime = .zero
     private let prerollSeconds = 1.0
@@ -68,6 +75,7 @@ final class TStreamSampleBufferPlayer: NSObject {
     }
 
     deinit {
+        if let progressObserver { synchronizer.removeTimeObserver(progressObserver) }
         displayLayer.stopRequestingMediaData()
         audioRenderer.stopRequestingMediaData()
         source.stop()
@@ -78,10 +86,42 @@ final class TStreamSampleBufferPlayer: NSObject {
         source.start()
     }
 
+    /// Freeze playback (video + audio) by holding the synchronizer at rate 0.
+    /// The network source pauses itself via backpressure once the frozen clock
+    /// stops draining the buffer, so we don't keep downloading indefinitely.
+    func pause() {
+        renderQueue.async {
+            guard !self.userPaused, !self.stopped else { return }
+            self.userPaused = true
+            // If the clock hasn't started yet, `startClockIfReady` will honour
+            // `userPaused` and bring it up at rate 0 (first frame shown, frozen).
+            if self.clockStarted { self.synchronizer.rate = 0 }
+        }
+    }
+
+    /// Resume after `pause()`: restart the clock, re-arm the drains (they stop
+    /// themselves when the display layer fills while paused) and let the
+    /// backpressure check resume the network source once the buffer drains.
+    func resume() {
+        renderQueue.async {
+            guard self.userPaused, !self.stopped else { return }
+            self.userPaused = false
+            guard self.clockStarted else { return }
+            self.synchronizer.rate = 1
+            self.armVideo()
+            self.armAudio()
+            self.scheduleResumeCheck()
+        }
+    }
+
     func stop() {
         renderQueue.async {
             guard !self.stopped else { return }
             self.stopped = true
+            if let observer = self.progressObserver {
+                self.synchronizer.removeTimeObserver(observer)
+                self.progressObserver = nil
+            }
             self.displayLayer.stopRequestingMediaData()
             self.audioRenderer.stopRequestingMediaData()
             self.videoRequesting = false
@@ -177,7 +217,15 @@ final class TStreamSampleBufferPlayer: NSObject {
         guard !stopped, !clockStarted, let firstVideoPTS else { return }
         guard CMTimeGetSeconds(latestVideoPTS - firstVideoPTS) >= prerollSeconds else { return }
         clockStarted = true
-        synchronizer.setRate(1.0, time: firstVideoPTS)
+        // Honour a pause requested during buffering: bring the clock up frozen
+        // (the first frame is presented) instead of auto-playing.
+        synchronizer.setRate(userPaused ? 0 : 1.0, time: firstVideoPTS)
+        let base = firstVideoPTS
+        progressObserver = synchronizer.addPeriodicTimeObserver(
+            forInterval: CMTime(seconds: 0.25, preferredTimescale: 600), queue: .main
+        ) { [weak self] time in
+            self?.onProgress?(max(0, CMTimeGetSeconds(time - base)))
+        }
         DispatchQueue.main.async { [weak self] in self?.onReadyToPlay?() }
         TStreamDiagnostics.log("sbplayer: clock started at \(CMTimeGetSeconds(firstVideoPTS))s")
     }
