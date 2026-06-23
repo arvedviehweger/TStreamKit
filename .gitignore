@@ -8,3 +8,6 @@ DerivedData/
 .swiftpm/
 *.xcodeproj
 Package.resolved
+
+# FFmpeg source + build tree (regenerate with scripts/build-ffmpeg.sh)
+/.ffmpeg-build/
