@@ -62,15 +62,23 @@ enum H264 {
     /// Builds an AVCC access unit (4-byte length prefixes) from NAL units,
     /// dropping parameter sets and access-unit delimiters (those live in the
     /// `avcC` config box, not the sample data).
-    static func avccSample(from nals: [NAL]) -> (data: Data, isKeyframe: Bool) {
+    ///
+    /// Broadcast H.264 can use open GOPs with non-IDR I-slices plus recovery
+    /// points instead of IDR frames, so I-slices are treated as segment starts.
+    static func avccSample(from nals: [NAL]) -> (data: Data, isKeyframe: Bool, startsSegment: Bool, syncType: VideoSyncType) {
         var out = Data()
-        var keyframe = false
+        var syncType: VideoSyncType = .none
+        var hasVCL = false
         for nal in nals {
             switch nal.type {
             case NALType.sps.rawValue, NALType.pps.rawValue, NALType.accessUnitDelimiter.rawValue:
                 continue
             case NALType.idr.rawValue:
-                keyframe = true
+                hasVCL = true
+                syncType = .idr
+            case NALType.nonIDR.rawValue:
+                hasVCL = true
+                if syncType == .none, isISlice(nal) { syncType = .nonIDRIntra }
             default:
                 break
             }
@@ -81,15 +89,95 @@ enum H264 {
             out.append(UInt8(length & 0xFF))
             out.append(contentsOf: nal.bytes)
         }
-        return (out, keyframe)
+        guard hasVCL else { return (Data(), false, false, .none) }
+        let startsSegment = syncType != .none
+        return (out, syncType != .none, startsSegment, syncType)
+    }
+
+    /// True when a coded-slice NAL holds an I-slice. The slice header begins at
+    /// the byte after the 1-byte NAL header with `first_mb_in_slice` (ue) then
+    /// `slice_type` (ue); `slice_type % 5 == 2` is an I-slice (values 2 and 7).
+    private static func isISlice(_ nal: NAL) -> Bool {
+        let rbsp = ebspToRBSP(nal.bytes)
+        guard !rbsp.isEmpty else { return false }
+        var reader = BitReader(rbsp)
+        _ = reader.readUE()                        // first_mb_in_slice
+        guard let sliceType = reader.readUE() else { return false }
+        return sliceType % 5 == 2
+    }
+
+    /// Strips the 1-byte NAL header and emulation-prevention bytes, leaving the
+    /// RBSP a `BitReader` can consume directly.
+    private static func ebspToRBSP(_ bytes: ArraySlice<UInt8>) -> [UInt8] {
+        let raw = Array(bytes)
+        guard raw.count > 1 else { return [] }
+        var rbsp: [UInt8] = []
+        rbsp.reserveCapacity(raw.count - 1)
+        var zeroRun = 0
+        for k in 1..<raw.count {
+            let byte = raw[k]
+            if zeroRun >= 2, byte == 0x03 { zeroRun = 0; continue }
+            rbsp.append(byte)
+            zeroRun = (byte == 0) ? zeroRun + 1 : 0
+        }
+        return rbsp
+    }
+
+    /// Per-picture field info from the first VCL slice header, used to pair PAFF
+    /// complementary fields into frames. `frame_num` identifies the frame a
+    /// field belongs to; `bottomField` distinguishes the two fields of a pair.
+    struct FieldInfo {
+        let fieldPicture: Bool
+        let bottomField: Bool
+        let frameNum: UInt32
+    }
+
+    /// Reads `frame_num` and the field flags from the first coded-slice NAL.
+    /// The slice header order (7.3.3) is `first_mb_in_slice` ue, `slice_type`
+    /// ue, `pic_parameter_set_id` ue, `frame_num` u(log2MaxFrameNum), then —
+    /// when the SPS is not frame-only — `field_pic_flag` and `bottom_field_flag`.
+    /// (`separate_colour_plane_flag` only applies to 4:4:4, not Main profile.)
+    static func fieldInfo(fromFirstSlice nals: [NAL], log2MaxFrameNum: Int) -> FieldInfo? {
+        for nal in nals where nal.type == NALType.nonIDR.rawValue || nal.type == NALType.idr.rawValue {
+            let rbsp = ebspToRBSP(nal.bytes)
+            guard !rbsp.isEmpty else { return nil }
+            var r = BitReader(rbsp)
+            _ = r.readUE()                          // first_mb_in_slice
+            _ = r.readUE()                          // slice_type
+            _ = r.readUE()                          // pic_parameter_set_id
+            guard let frameNum = r.readBits(log2MaxFrameNum),
+                  let fieldPicFlag = r.readBits(1) else { return nil }
+            if fieldPicFlag == 0 {
+                return FieldInfo(fieldPicture: false, bottomField: false, frameNum: frameNum)
+            }
+            guard let bottom = r.readBits(1) else { return nil }
+            return FieldInfo(fieldPicture: true, bottomField: bottom == 1, frameNum: frameNum)
+        }
+        return nil
     }
 
     /// Coded picture dimensions decoded from an SPS, when available.
     struct Dimensions { let width: Int; let height: Int }
 
-    /// Minimal SPS parser: decodes just enough to recover frame width/height.
-    /// Returns `nil` if the SPS is too short or uses fields we don't decode.
+    /// Fields the demuxer needs from the SPS: picture size, the bit width of
+    /// `frame_num` (for slice-header parsing), and whether the stream is
+    /// frame-only (progressive) or may carry field pictures (interlaced PAFF).
+    struct SPSInfo {
+        let width: Int
+        let height: Int
+        let log2MaxFrameNum: Int
+        let frameMbsOnly: Bool
+    }
+
+    /// Convenience wrapper returning just the dimensions.
     static func parseSPS(_ sps: ArraySlice<UInt8>) -> Dimensions? {
+        parseSPSInfo(sps).map { Dimensions(width: $0.width, height: $0.height) }
+    }
+
+    /// Minimal SPS parser: decodes width/height, `log2_max_frame_num`, and
+    /// `frame_mbs_only_flag`. Returns `nil` if the SPS is too short or uses
+    /// fields we don't decode.
+    static func parseSPSInfo(_ sps: ArraySlice<UInt8>) -> SPSInfo? {
         // Strip emulation-prevention bytes and the NAL header byte.
         let raw = Array(sps)
         guard raw.count > 1 else { return nil }
@@ -123,7 +211,7 @@ enum H264 {
             }
         }
 
-        _ = reader.readUE()               // log2_max_frame_num_minus4
+        let log2MaxFrameNumMinus4 = reader.readUE() ?? 0
         let picOrderCntType = reader.readUE() ?? 0
         if picOrderCntType == 0 {
             _ = reader.readUE()           // log2_max_pic_order_cnt_lsb_minus4
@@ -160,7 +248,10 @@ enum H264 {
         let croppedWidth = width - (cropLeft + cropRight) * 2
         let croppedHeight = height - (cropTop + cropBottom) * 2
         guard croppedWidth > 0, croppedHeight > 0 else { return nil }
-        return Dimensions(width: croppedWidth, height: croppedHeight)
+        return SPSInfo(width: croppedWidth,
+                       height: croppedHeight,
+                       log2MaxFrameNum: Int(log2MaxFrameNumMinus4) + 4,
+                       frameMbsOnly: frameMbsOnly == 1)
     }
 }
 

@@ -9,6 +9,10 @@ import AppKit
 
 /// A SwiftUI view that plays an HTTP MPEG-TS stream through the TStream pipeline.
 ///
+/// Internally it decodes the demuxed access units directly through an
+/// `AVSampleBufferDisplayLayer` whose VideoToolbox session we control — this
+/// recovers from the open-GOP / non-IDR broadcast streams that derail AVPlayer.
+///
 /// ```swift
 /// struct PlayerScreen: View {
 ///     var body: some View {
@@ -18,12 +22,14 @@ import AppKit
 /// ```
 public struct TStreamPlayerView: View {
     private let url: URL
+    private let headers: [String: String]
     private let autoPlay: Bool
     private var onError: ((TStreamError) -> Void)?
     private var onReady: (() -> Void)?
 
-    public init(url: URL, autoPlay: Bool = true) {
+    public init(url: URL, headers: [String: String] = [:], autoPlay: Bool = true) {
         self.url = url
+        self.headers = headers
         self.autoPlay = autoPlay
     }
 
@@ -42,14 +48,15 @@ public struct TStreamPlayerView: View {
     }
 
     public var body: some View {
-        _TStreamPlayerContainer(url: url, autoPlay: autoPlay, onError: onError, onReady: onReady)
+        _TStreamPlayerContainer(url: url, headers: headers, autoPlay: autoPlay, onError: onError, onReady: onReady)
     }
 }
 
-/// Owns the `TStreamPlayer` for the lifetime of the view and bridges the
-/// platform player layer into SwiftUI.
+/// Owns the `TStreamSampleBufferPlayer` for the lifetime of the view and bridges
+/// its display layer into SwiftUI.
 private struct _TStreamPlayerContainer: View {
     let url: URL
+    let headers: [String: String]
     let autoPlay: Bool
     let onError: ((TStreamError) -> Void)?
     let onReady: (() -> Void)?
@@ -57,110 +64,116 @@ private struct _TStreamPlayerContainer: View {
     @StateObject private var model = PlayerModel()
 
     var body: some View {
-        PlayerLayerView(player: model.player)
-            .onAppear {
-                model.configure(url: url, autoPlay: autoPlay, onError: onError, onReady: onReady)
+        ZStack {
+            Color.black
+            if let player = model.player {
+                DisplayLayerView(layer: player.displayLayer)
             }
-            .onDisappear {
-                model.teardown()
-            }
+        }
+        .onAppear {
+            model.configure(url: url, headers: headers, autoPlay: autoPlay, onError: onError, onReady: onReady)
+        }
+        .onDisappear {
+            model.teardown()
+        }
     }
 }
 
 private final class PlayerModel: ObservableObject {
-    private(set) var player = AVPlayer()
-    private var tstream: TStreamPlayer?
+    @Published private(set) var player: TStreamSampleBufferPlayer?
 
-    func configure(url: URL, autoPlay: Bool, onError: ((TStreamError) -> Void)?, onReady: (() -> Void)?) {
-        guard tstream == nil else { return }
-        do {
-            let tstream = try TStreamPlayer(url: url)
-            tstream.onError = onError
-            tstream.onReadyToPlay = onReady
-            self.tstream = tstream
-            self.player = tstream.player
-            objectWillChange.send()
-            if autoPlay { tstream.play() }
-        } catch let error as TStreamError {
-            onError?(error)
-        } catch {
-            onError?(.invalidURL(url.absoluteString))
-        }
+    func configure(url: URL, headers: [String: String], autoPlay: Bool,
+                   onError: ((TStreamError) -> Void)?, onReady: (() -> Void)?) {
+        guard player == nil else { return }
+        let player = TStreamSampleBufferPlayer(url: url, headers: headers)
+        player.onError = onError
+        player.onReadyToPlay = onReady
+        self.player = player
+        if autoPlay { player.play() }
     }
 
     func teardown() {
-        tstream?.stop()
-        tstream = nil
+        player?.stop()
+        player = nil
     }
 }
 
-// MARK: - Platform player layer
+// MARK: - Display layer host
 
 #if canImport(UIKit)
-private struct PlayerLayerView: UIViewRepresentable {
-    let player: AVPlayer
+private struct DisplayLayerView: UIViewRepresentable {
+    let layer: AVSampleBufferDisplayLayer
 
-    func makeUIView(context: Context) -> PlayerLayerHostView {
-        let view = PlayerLayerHostView()
-        view.playerLayer.player = player
+    func makeUIView(context: Context) -> SampleBufferHostView {
+        let view = SampleBufferHostView()
+        view.attach(layer)
         return view
     }
 
-    func updateUIView(_ uiView: PlayerLayerHostView, context: Context) {
-        uiView.playerLayer.player = player
+    func updateUIView(_ uiView: SampleBufferHostView, context: Context) {
+        uiView.attach(layer)
     }
 }
 
-final class PlayerLayerHostView: UIView {
-    override class var layerClass: AnyClass { AVPlayerLayer.self }
-    var playerLayer: AVPlayerLayer { layer as! AVPlayerLayer }
+final class SampleBufferHostView: UIView {
+    private weak var attached: AVSampleBufferDisplayLayer?
 
-    override init(frame: CGRect) {
-        super.init(frame: frame)
-        playerLayer.videoGravity = .resizeAspect
+    func attach(_ displayLayer: AVSampleBufferDisplayLayer) {
+        guard attached !== displayLayer else { return }
+        attached?.removeFromSuperlayer()
+        displayLayer.videoGravity = .resizeAspect
+        displayLayer.frame = bounds
+        layer.addSublayer(displayLayer)
+        attached = displayLayer
     }
 
-    required init?(coder: NSCoder) {
-        super.init(coder: coder)
-        playerLayer.videoGravity = .resizeAspect
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        attached?.frame = bounds
     }
 }
 
 #elseif canImport(AppKit)
-private struct PlayerLayerView: NSViewRepresentable {
-    let player: AVPlayer
+private struct DisplayLayerView: NSViewRepresentable {
+    let layer: AVSampleBufferDisplayLayer
 
-    func makeNSView(context: Context) -> PlayerLayerHostView {
-        let view = PlayerLayerHostView()
-        view.playerLayer.player = player
+    func makeNSView(context: Context) -> SampleBufferHostView {
+        let view = SampleBufferHostView()
+        view.attach(layer)
         return view
     }
 
-    func updateNSView(_ nsView: PlayerLayerHostView, context: Context) {
-        nsView.playerLayer.player = player
+    func updateNSView(_ nsView: SampleBufferHostView, context: Context) {
+        nsView.attach(layer)
     }
 }
 
-final class PlayerLayerHostView: NSView {
-    let playerLayer = AVPlayerLayer()
+final class SampleBufferHostView: NSView {
+    private weak var attached: AVSampleBufferDisplayLayer?
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         wantsLayer = true
-        playerLayer.videoGravity = .resizeAspect
-        layer?.addSublayer(playerLayer)
+        layer?.backgroundColor = NSColor.black.cgColor
     }
 
     required init?(coder: NSCoder) {
         super.init(coder: coder)
         wantsLayer = true
-        playerLayer.videoGravity = .resizeAspect
-        layer?.addSublayer(playerLayer)
+    }
+
+    func attach(_ displayLayer: AVSampleBufferDisplayLayer) {
+        guard attached !== displayLayer else { return }
+        attached?.removeFromSuperlayer()
+        displayLayer.videoGravity = .resizeAspect
+        displayLayer.frame = bounds
+        layer?.addSublayer(displayLayer)
+        attached = displayLayer
     }
 
     override func layout() {
         super.layout()
-        playerLayer.frame = bounds
+        attached?.frame = bounds
     }
 }
 #endif
