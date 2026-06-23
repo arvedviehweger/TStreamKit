@@ -44,6 +44,15 @@ final class TStreamSampleBufferPlayer: NSObject {
     private var audioRequesting = false
     private var stopped = false
 
+    // Backpressure: a recording downloads as fast as the link allows, so without
+    // throttling every frame is decoded into an (uncompressed) CVPixelBuffer and
+    // piled into `videoQueue` faster than the real-time clock drains it — the app
+    // is OOM-killed within seconds. We suspend the network source once we are
+    // `highWaterSeconds` ahead of the playback clock and resume below `lowWater`.
+    private var sourcePaused = false
+    private let highWaterSeconds = 4.0
+    private let lowWaterSeconds = 2.0
+
     init(url: URL, headers: [String: String] = [:]) {
         self.source = TSDemuxSource(httpURL: url, headers: headers)
         super.init()
@@ -132,6 +141,38 @@ final class TStreamSampleBufferPlayer: NSObject {
         }
     }
 
+    // MARK: - Backpressure (on renderQueue)
+
+    /// Seconds of video decoded ahead of the playback position. Before the clock
+    /// starts we measure against the first PTS (we're still prerolling).
+    private func bufferedAheadSeconds() -> Double {
+        guard let firstVideoPTS else { return 0 }
+        let clock = clockStarted ? synchronizer.currentTime() : firstVideoPTS
+        return CMTimeGetSeconds(latestVideoPTS - clock)
+    }
+
+    private func updateBackpressure() {
+        guard !stopped, !sourcePaused else { return }
+        guard bufferedAheadSeconds() >= highWaterSeconds else { return }
+        sourcePaused = true
+        source.pause()
+        scheduleResumeCheck()
+    }
+
+    /// While paused the drain blocks may stop firing (the display layer is full),
+    /// so poll the clock until the buffer drains, then resume the download.
+    private func scheduleResumeCheck() {
+        renderQueue.asyncAfter(deadline: .now() + 0.25) { [weak self] in
+            guard let self, self.sourcePaused, !self.stopped else { return }
+            if self.bufferedAheadSeconds() <= self.lowWaterSeconds {
+                self.sourcePaused = false
+                self.source.resume()
+            } else {
+                self.scheduleResumeCheck()
+            }
+        }
+    }
+
     private func startClockIfReady() {
         guard !stopped, !clockStarted, let firstVideoPTS else { return }
         guard CMTimeGetSeconds(latestVideoPTS - firstVideoPTS) >= prerollSeconds else { return }
@@ -207,6 +248,7 @@ extension TStreamSampleBufferPlayer: TSDemuxerDelegate {
         videoQueue.append(sample)
         armVideo()
         startClockIfReady()
+        updateBackpressure()
     }
 
     private func ingestAudio(_ unit: AccessUnit) {

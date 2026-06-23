@@ -22,6 +22,7 @@ final class TSDemuxSource: NSObject {
     private let demuxer = TSDemuxer()
     private var failure: TStreamError?
     private var stopped = false
+    private var paused = false
 
     /// Forward raw video PES (for libavcodec) instead of parsed access units.
     var rawVideoMode: Bool {
@@ -49,6 +50,27 @@ final class TSDemuxSource: NSObject {
             self.dataTask = task
             task.resume()
             TStreamDiagnostics.log("source: started fetching \(self.httpURL.absoluteString)")
+        }
+    }
+
+    /// Backpressure: stop reading from the socket. The TCP receive window fills
+    /// and tvheadend stops sending — without this a recording (served as fast as
+    /// the connection allows, unlike a rate-limited live stream) floods the
+    /// decoder and the decoded-frame queues grow until the app is OOM-killed.
+    func pause() {
+        queue.async {
+            guard !self.stopped, !self.paused, let task = self.dataTask else { return }
+            self.paused = true
+            task.suspend()
+        }
+    }
+
+    /// Resume reading once the player has drained its buffer back down.
+    func resume() {
+        queue.async {
+            guard !self.stopped, self.paused, let task = self.dataTask else { return }
+            self.paused = false
+            task.resume()
         }
     }
 
