@@ -22,6 +22,12 @@ LIBS=(libavcodec libavutil libswscale libavfilter)
 # --- minimal LGPL feature set ------------------------------------------------
 CONFIGURE_COMMON=(
   --disable-gpl --enable-version3            # LGPL v3, no GPL components
+  # Hermetic build: never auto-detect/link host libraries. Without this the
+  # native macOS build picks up Homebrew's libX11 (/opt/homebrew/.../libX11.6
+  # .dylib) and links it into every lib, which then fails to load in a signed
+  # app (different Team ID) and crashes at launch. We use none of those external
+  # libs (software decode + bwdif/yadif only).
+  --disable-autodetect
   --disable-everything
   --enable-avcodec --enable-avutil --enable-swscale --enable-avfilter
   --enable-decoder=h264,hevc,mpeg2video,mpeg4
