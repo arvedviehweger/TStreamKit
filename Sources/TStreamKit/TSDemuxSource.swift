@@ -24,6 +24,12 @@ final class TSDemuxSource: NSObject {
     private var stopped = false
     private var paused = false
 
+    /// Byte offset of the current request (0 for the initial, non-ranged fetch).
+    private var rangeOffset: Int64 = 0
+    /// Total length of the resource in bytes, learned from the first response.
+    /// Used to translate a seek fraction into a byte offset. 0 until known.
+    private(set) var totalBytes: Int64 = 0
+
     /// Forward raw video PES (for libavcodec) instead of parsed access units.
     var rawVideoMode: Bool {
         get { demuxer.rawVideoMode }
@@ -41,16 +47,46 @@ final class TSDemuxSource: NSObject {
     func start() {
         queue.async {
             guard self.dataTask == nil, self.failure == nil, !self.stopped else { return }
-            var request = URLRequest(url: self.httpURL)
-            request.setValue("identity", forHTTPHeaderField: "Accept-Encoding")
-            for (field, value) in self.httpHeaders {
-                request.setValue(value, forHTTPHeaderField: field)
-            }
-            let task = self.session.dataTask(with: request)
-            self.dataTask = task
-            task.resume()
+            self.startRequest(rangeOffset: 0)
             TStreamDiagnostics.log("source: started fetching \(self.httpURL.absoluteString)")
         }
+    }
+
+    /// Seeks to a byte offset by cancelling the current download, resetting the
+    /// parser/demuxer (so they resync to the next TS packet and re-acquire
+    /// PAT/PMT), and re-issuing the request with an HTTP `Range` header. The
+    /// completion fires on the source queue *after* the new request has started
+    /// — the player uses it as a barrier to discard any in-flight pre-seek data.
+    func seek(toByteOffset offset: Int64, completion: @escaping () -> Void) {
+        queue.async {
+            guard !self.stopped else { return }
+            self.dataTask?.cancel()
+            self.dataTask = nil
+            self.parser.reset()
+            self.demuxer.reset()
+            self.paused = false
+            self.startRequest(rangeOffset: max(0, offset))
+            TStreamDiagnostics.log("source: seek to byte \(offset)")
+            completion()
+        }
+    }
+
+    /// Issues the HTTP request, adding a `Range` header when seeking into the
+    /// resource. Must be called on `queue`.
+    private func startRequest(rangeOffset: Int64) {
+        guard self.failure == nil, !self.stopped else { return }
+        self.rangeOffset = rangeOffset
+        var request = URLRequest(url: self.httpURL)
+        request.setValue("identity", forHTTPHeaderField: "Accept-Encoding")
+        for (field, value) in self.httpHeaders {
+            request.setValue(value, forHTTPHeaderField: field)
+        }
+        if rangeOffset > 0 {
+            request.setValue("bytes=\(rangeOffset)-", forHTTPHeaderField: "Range")
+        }
+        let task = self.session.dataTask(with: request)
+        self.dataTask = task
+        task.resume()
     }
 
     /// Backpressure: stop reading from the socket. The TCP receive window fills
@@ -99,7 +135,8 @@ final class TSDemuxSource: NSObject {
 extension TSDemuxSource: URLSessionDataDelegate {
     func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
         queue.async {
-            guard self.failure == nil, !self.stopped else { return }
+            // Drop bytes from a task we've already replaced (e.g. after a seek).
+            guard self.failure == nil, !self.stopped, dataTask == self.dataTask else { return }
             for packet in self.parser.push(data) { self.demuxer.consume(packet) }
         }
     }
@@ -107,17 +144,26 @@ extension TSDemuxSource: URLSessionDataDelegate {
     func urlSession(_ session: URLSession, dataTask: URLSessionDataTask,
                     didReceive response: URLResponse,
                     completionHandler: @escaping (URLSession.ResponseDisposition) -> Void) {
+        // 200 (full) and 206 (partial, from a Range request) are both fine.
         if let http = response as? HTTPURLResponse, !(200...299).contains(http.statusCode) {
             queue.async { [weak self] in self?.fail(.transport("HTTP \(http.statusCode)")) }
             completionHandler(.cancel)
             return
+        }
+        // expectedContentLength is the length of *this* response: for a ranged
+        // request that's the remainder, so add the offset to get the total.
+        let expected = response.expectedContentLength
+        queue.async { [weak self] in
+            guard let self else { return }
+            if expected > 0 { self.totalBytes = self.rangeOffset + expected }
         }
         completionHandler(.allow)
     }
 
     func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
         queue.async {
-            guard !self.stopped else { return }
+            // Ignore completion of a task we've already replaced (seek/cancel).
+            guard !self.stopped, task == self.dataTask else { return }
             if let error, (error as NSError).code != NSURLErrorCancelled {
                 self.fail(.transport(error.localizedDescription))
                 return

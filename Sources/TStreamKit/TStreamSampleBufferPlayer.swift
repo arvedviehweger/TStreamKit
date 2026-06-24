@@ -40,6 +40,15 @@ final class TStreamSampleBufferPlayer: NSObject {
     /// set, the synchronizer rate is held at 0 so video *and* audio freeze.
     private var userPaused = false
     private var progressObserver: Any?
+    /// PTS of the very first frame of the whole stream — the anchor for absolute
+    /// position reporting. Unlike `firstVideoPTS` it is NOT reset on a seek, so
+    /// `onProgress` keeps reporting the true offset within the recording.
+    private var streamStartPTS: CMTime?
+    /// True between requesting a seek and the source confirming the new request
+    /// has started. While set, decoded frames are discarded so stale pre-seek
+    /// data can't anchor the clock at the wrong position.
+    private var discardingUntilSeek = false
+    /// PTS anchor for the current segment (reset on every seek).
     private var firstVideoPTS: CMTime?
     private var latestVideoPTS: CMTime = .zero
     private let prerollSeconds = 1.0
@@ -112,6 +121,49 @@ final class TStreamSampleBufferPlayer: NSObject {
             self.armAudio()
             self.scheduleResumeCheck()
         }
+    }
+
+    /// Seek to a fraction (0…1) of the recording. Approximate / GOP-accurate:
+    /// the byte offset is `fraction × totalBytes`, the source resyncs to the
+    /// next TS packet, and decoding resumes at the next keyframe. Absolute
+    /// position (`onProgress`) stays correct because it is anchored to
+    /// `streamStartPTS`, not the per-segment `firstVideoPTS`.
+    func seek(toFraction fraction: Double) {
+        let f = min(max(fraction, 0), 1)
+        renderQueue.async {
+            guard !self.stopped else { return }
+            let total = self.source.totalBytes
+            guard total > 0 else { return }
+            self.flushForSeek()
+            let offset = Int64(Double(total) * f)
+            self.source.seek(toByteOffset: offset) { [weak self] in
+                self?.renderQueue.async { self?.discardingUntilSeek = false }
+            }
+        }
+    }
+
+    /// Tear down all decode/render state for the current position so the seeked
+    /// segment starts clean. Keeps `streamStartPTS` (absolute anchor) and the
+    /// audio format. Runs on `renderQueue`.
+    private func flushForSeek() {
+        if let observer = progressObserver {
+            synchronizer.removeTimeObserver(observer)
+            progressObserver = nil
+        }
+        synchronizer.rate = 0
+        displayLayer.stopRequestingMediaData(); videoRequesting = false
+        audioRenderer.stopRequestingMediaData(); audioRequesting = false
+        displayLayer.flush()
+        audioRenderer.flush()
+        videoQueue.removeAll()
+        audioQueue.removeAll()
+        ffDecoder = nil          // fresh decoder waits for the next keyframe
+        clockStarted = false
+        firstVideoPTS = nil
+        latestVideoPTS = .zero
+        sawVideo = false
+        sourcePaused = false
+        discardingUntilSeek = true
     }
 
     func stop() {
@@ -220,11 +272,12 @@ final class TStreamSampleBufferPlayer: NSObject {
         // Honour a pause requested during buffering: bring the clock up frozen
         // (the first frame is presented) instead of auto-playing.
         synchronizer.setRate(userPaused ? 0 : 1.0, time: firstVideoPTS)
-        let base = firstVideoPTS
         progressObserver = synchronizer.addPeriodicTimeObserver(
             forInterval: CMTime(seconds: 0.25, preferredTimescale: 600), queue: .main
         ) { [weak self] time in
-            self?.onProgress?(max(0, CMTimeGetSeconds(time - base)))
+            // Report absolute offset within the recording (survives seeks).
+            guard let self, let base = self.streamStartPTS else { return }
+            self.onProgress?(max(0, CMTimeGetSeconds(time - base)))
         }
         DispatchQueue.main.async { [weak self] in self?.onReadyToPlay?() }
         TStreamDiagnostics.log("sbplayer: clock started at \(CMTimeGetSeconds(firstVideoPTS))s")
@@ -269,7 +322,7 @@ extension TStreamSampleBufferPlayer: TSDemuxerDelegate {
     // MARK: ingest (on renderQueue)
 
     private func ingestRawVideo(_ data: Data, codec: VideoCodec, pts: UInt64, dts: UInt64) {
-        guard !stopped else { return }
+        guard !stopped, !discardingUntilSeek else { return }
         if ffDecoder == nil {
             ffDecoder = TStreamFFVideoDecoder(codec: codec)
             if ffDecoder == nil {
@@ -291,6 +344,7 @@ extension TStreamSampleBufferPlayer: TSDemuxerDelegate {
         // synchronizer drives display from PTS, so leave it invalid.
         guard let sample = Self.makeVideoSampleBuffer(
             pixelBuffer: frame.pixelBuffer, pts: pts, duration: .invalid) else { return }
+        if streamStartPTS == nil { streamStartPTS = pts }
         if firstVideoPTS == nil { firstVideoPTS = pts }
         latestVideoPTS = pts
         videoQueue.append(sample)
@@ -300,7 +354,7 @@ extension TStreamSampleBufferPlayer: TSDemuxerDelegate {
     }
 
     private func ingestAudio(_ unit: AccessUnit) {
-        guard !stopped else { return }
+        guard !stopped, !discardingUntilSeek else { return }
         guard sawVideo, let desc = audioFormatDesc else { return }
         guard let sample = Self.makeCompressedSampleBuffer(
             data: unit.data, formatDescription: desc,

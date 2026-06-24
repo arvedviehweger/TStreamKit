@@ -20,11 +20,25 @@ import AppKit
 ///     }
 /// }
 /// ```
+/// An imperative handle for actions that are events rather than state — chiefly
+/// seeking. Create one in the host (`@State`), pass it via `.handle(_:)`, and
+/// call `seek(toFraction:)` in response to user scrubbing.
+public final class TStreamPlayerHandle {
+    weak var player: TStreamSampleBufferPlayer?
+    public init() {}
+
+    /// Seek to a fraction (0…1) of the recording. GOP-accurate.
+    public func seek(toFraction fraction: Double) {
+        player?.seek(toFraction: fraction)
+    }
+}
+
 public struct TStreamPlayerView: View {
     private let url: URL
     private let headers: [String: String]
     private let autoPlay: Bool
     private var isPaused: Bool = false
+    private var handle: TStreamPlayerHandle?
     private var onError: ((TStreamError) -> Void)?
     private var onReady: (() -> Void)?
     private var onProgress: ((TimeInterval) -> Void)?
@@ -65,10 +79,17 @@ public struct TStreamPlayerView: View {
         return copy
     }
 
+    /// Attaches an imperative handle for seeking.
+    public func handle(_ handle: TStreamPlayerHandle) -> TStreamPlayerView {
+        var copy = self
+        copy.handle = handle
+        return copy
+    }
+
     public var body: some View {
         _TStreamPlayerContainer(url: url, headers: headers, autoPlay: autoPlay,
-                                isPaused: isPaused, onError: onError, onReady: onReady,
-                                onProgress: onProgress)
+                                isPaused: isPaused, handle: handle, onError: onError,
+                                onReady: onReady, onProgress: onProgress)
     }
 }
 
@@ -79,6 +100,7 @@ private struct _TStreamPlayerContainer: View {
     let headers: [String: String]
     let autoPlay: Bool
     let isPaused: Bool
+    let handle: TStreamPlayerHandle?
     let onError: ((TStreamError) -> Void)?
     let onReady: (() -> Void)?
     let onProgress: ((TimeInterval) -> Void)?
@@ -95,6 +117,7 @@ private struct _TStreamPlayerContainer: View {
         .onAppear {
             model.configure(url: url, headers: headers, autoPlay: autoPlay,
                             onError: onError, onReady: onReady, onProgress: onProgress)
+            handle?.player = model.player
             model.setPaused(isPaused)
         }
         .onChange(of: isPaused) { paused in
