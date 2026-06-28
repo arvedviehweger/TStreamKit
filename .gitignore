@@ -7,6 +7,9 @@ xcuserdata/
 DerivedData/
 .swiftpm/
 *.xcodeproj
+# …but do track the demo's project so the bundled demo is openable on clone.
+!TStreamKitDemo/TStreamKitDemo.xcodeproj
+TStreamKitDemo/TStreamKitDemo.xcodeproj/**/xcuserdata/
 Package.resolved
 
 # FFmpeg source + build tree (regenerate with scripts/build-ffmpeg.sh)
