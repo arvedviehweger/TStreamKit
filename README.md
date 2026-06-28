@@ -1,9 +1,17 @@
 # TStreamKit
 
+[![Swift](https://img.shields.io/badge/Swift-6.0-orange.svg)](https://swift.org)
+[![Platforms](https://img.shields.io/badge/Platforms-iOS%20%7C%20tvOS%20%7C%20macOS-blue.svg)](#requirements)
+[![SwiftPM](https://img.shields.io/badge/SwiftPM-compatible-brightgreen.svg)](#installation)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![FFmpeg: LGPL v3](https://img.shields.io/badge/FFmpeg-LGPL%20v3-lightgrey.svg)](#lgpl-compliance)
+
 A native Swift package for **iOS / tvOS / macOS** that plays live HTTP
-**MPEG-TS** streams — the kind served by DVB tuners and gateways such as
-[Tvheadend](https://tvheadend.org) — directly on Apple devices, including the
-non-IDR, interlaced, open-GOP broadcast streams that `AVPlayer` chokes on.
+**MPEG-TS** streams — the raw transport streams served by DVB/ATSC tuners and
+gateways, SAT>IP servers, IPTV relays (`udpxy` & friends), capture boxes, and
+tools like `ffmpeg`/`VLC` — directly on Apple devices, including the non-IDR,
+interlaced, open-GOP broadcast streams that `AVPlayer` chokes on. If your source
+can serve an MPEG-TS over HTTP(S), TStreamKit can play it.
 
 TStreamKit demuxes the transport stream itself and decodes video with a minimal,
 self-built **FFmpeg `libavcodec`** (software decode with error concealment and
@@ -16,10 +24,27 @@ handle.
 > TStreamKit source is MIT, but shipping an app that embeds it carries LGPL
 > obligations. See [LGPL compliance](#lgpl-compliance).
 
+## Contents
+
+- [Pipeline](#pipeline)
+- [Requirements](#requirements)
+- [Installation](#installation)
+- [Usage](#usage)
+  - [SwiftUI](#swiftui)
+  - [View modifiers](#view-modifiers)
+  - [Seeking & progress (recordings)](#seeking--progress-recordings)
+  - [UIKit](#uikit)
+  - [AppKit](#appkit)
+  - [Diagnostics](#diagnostics)
+  - [App Transport Security](#app-transport-security)
+- [Codec support](#codec-support)
+- [LGPL compliance](#lgpl-compliance)
+- [License](#license)
+
 ## Pipeline
 
 ```
-HTTP MPEG-TS (Tvheadend, DVB gateway, …)
+HTTP MPEG-TS (DVB/ATSC gateway, SAT>IP, IPTV relay, ffmpeg, …)
         │
         ▼
 TSPacketParser ──► TSDemuxer (PAT/PMT/PES, codec + descriptor detection)
@@ -59,14 +84,18 @@ embeds and signs them automatically when you add the package to an app target.
 
 ## Usage
 
-The public API is a single SwiftUI view.
+The whole public API is one SwiftUI view, `TStreamPlayerView`, plus a small
+imperative `TStreamPlayerHandle` for seeking. Everything below builds on those
+two types.
+
+### SwiftUI
 
 ```swift
 import SwiftUI
 import TStreamKit
 
 struct PlayerScreen: View {
-    let url = URL(string: "http://tvheadend.local:9981/stream/channelid/123")!
+    let url = URL(string: "http://192.168.1.10:8080/stream.ts")!
 
     var body: some View {
         TStreamPlayerView(url: url, headers: ["Authorization": "Basic …"])
@@ -78,17 +107,187 @@ struct PlayerScreen: View {
 ```
 
 `TStreamPlayerView` starts playback on appear and tears the player down on
-disappear. `headers` are sent with the HTTP request (e.g. for Basic auth);
-`autoPlay: false` defers playback.
+disappear. The view fills its container and renders into a black background, so
+size it like any other view (`.frame`, `.aspectRatio(16/9, contentMode: .fit)`,
+`.ignoresSafeArea()`, …).
 
-### UIKit / AppKit
+Initializer parameters:
 
-Host the SwiftUI view in a `UIHostingController` (or `NSHostingController`):
+| Parameter  | Type                  | Default | Meaning                                              |
+|------------|-----------------------|---------|------------------------------------------------------|
+| `url`      | `URL`                 | —       | HTTP(S) MPEG-TS endpoint.                            |
+| `headers`  | `[String: String]`    | `[:]`   | Extra HTTP request headers, e.g. `Authorization`.    |
+| `autoPlay` | `Bool`                | `true`  | Start on appear. Pass `false` to defer playback.     |
+
+> **Reloading a stream:** to switch URLs or restart, give the view a changing
+> `.id(...)` so SwiftUI rebuilds it (the bundled demo uses a `reloadToken`).
+
+### View modifiers
+
+Each modifier returns a new `TStreamPlayerView`, so they chain. All callbacks
+fire on the **main thread**.
+
+| Modifier                       | Purpose                                                                 |
+|--------------------------------|-------------------------------------------------------------------------|
+| `.onReadyToPlay { }`           | Called once when the clock starts and the first frame is on screen.     |
+| `.onPlaybackError { error }`   | Delivers a [`TStreamError`](Sources/TStreamKit/TStreamError.swift).     |
+| `.onProgress { seconds }`      | Elapsed seconds since the first frame, ~4×/second while playing.        |
+| `.paused(_ value: Bool)`       | Freeze (`true`) / resume (`false`) video **and** audio.                 |
+| `.handle(_ handle:)`           | Attach a `TStreamPlayerHandle` for imperative seeking (see below).      |
 
 ```swift
-let vc = UIHostingController(
-    rootView: TStreamPlayerView(url: url).ignoresSafeArea())
+struct PlayerScreen: View {
+    let url: URL
+    @State private var isPaused = false
+    @State private var elapsed: TimeInterval = 0
+
+    var body: some View {
+        VStack {
+            TStreamPlayerView(url: url)
+                .paused(isPaused)
+                .onProgress { elapsed = $0 }
+                .aspectRatio(16/9, contentMode: .fit)
+
+            HStack {
+                Button(isPaused ? "Resume" : "Pause") { isPaused.toggle() }
+                Text(timecode(elapsed)).monospacedDigit()
+            }
+        }
+    }
+}
+```
+
+### Seeking & progress (recordings)
+
+For **recordings** (a finite MPEG-TS file/endpoint with a known length) you can
+scrub. Seeking is *approximate / GOP-accurate*: it jumps to `fraction × totalBytes`,
+resyncs to the next TS packet, and resumes decoding at the next keyframe.
+Create a `TStreamPlayerHandle`, attach it with `.handle(_:)`, and call
+`seek(toFraction:)` (0…1) when the user scrubs.
+
+```swift
+struct RecordingPlayer: View {
+    let url: URL
+    @State private var handle = TStreamPlayerHandle()
+    @State private var elapsed: TimeInterval = 0
+    @State private var scrub: Double = 0
+
+    var body: some View {
+        VStack {
+            TStreamPlayerView(url: url)
+                .handle(handle)
+                .onProgress { elapsed = $0 }
+                .aspectRatio(16/9, contentMode: .fit)
+
+            Slider(value: $scrub, in: 0...1) { editing in
+                if !editing { handle.seek(toFraction: scrub) }  // seek on release
+            }
+        }
+    }
+}
+```
+
+> Live streams have no end, so `seek(toFraction:)` is a no-op until the source
+> reports a total byte count. `onProgress` reports an **absolute** offset that
+> stays correct across seeks.
+
+### UIKit
+
+There is no separate UIKit view — host `TStreamPlayerView` in a
+`UIHostingController`. The minimal case is a one-liner:
+
+```swift
+let player = TStreamPlayerView(url: url).ignoresSafeArea()
+let vc = UIHostingController(rootView: player)
 present(vc, animated: true)
+```
+
+To embed it in your own view controller and wire up the callbacks, pause and
+seeking, drive the hosting controller's `rootView` from state. A complete
+controller:
+
+```swift
+import UIKit
+import SwiftUI
+import TStreamKit
+
+final class StreamViewController: UIViewController {
+    private let url: URL
+    private let handle = TStreamPlayerHandle()
+    private var isPaused = false { didSet { updatePlayer() } }
+
+    private lazy var hosting = UIHostingController(rootView: makePlayer())
+    private let statusLabel = UILabel()
+    private let scrubber = UISlider()
+
+    init(url: URL) {
+        self.url = url
+        super.init(nibName: nil, bundle: nil)
+    }
+    required init?(coder: NSCoder) { fatalError("use init(url:)") }
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        view.backgroundColor = .black
+
+        // Embed the SwiftUI player as a child view controller.
+        addChild(hosting)
+        hosting.view.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(hosting.view)
+        hosting.didMove(toParent: self)
+
+        // … add statusLabel, a play/pause button, and `scrubber`, then: …
+        NSLayoutConstraint.activate([
+            hosting.view.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor),
+            hosting.view.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            hosting.view.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            hosting.view.heightAnchor.constraint(equalTo: hosting.view.widthAnchor,
+                                                 multiplier: 9.0 / 16.0),
+        ])
+        scrubber.addTarget(self, action: #selector(scrubEnded), for: .touchUpInside)
+    }
+
+    @objc private func togglePause() { isPaused.toggle() }
+
+    @objc private func scrubEnded() {
+        handle.seek(toFraction: Double(scrubber.value))   // 0…1
+    }
+
+    private func updatePlayer() { hosting.rootView = makePlayer() }
+
+    // Rebuild the SwiftUI view whenever state (e.g. pause) changes.
+    private func makePlayer() -> TStreamPlayerView {
+        TStreamPlayerView(url: url, headers: ["Authorization": "Basic …"])
+            .paused(isPaused)
+            .handle(handle)
+            .onReadyToPlay { [weak self] in self?.statusLabel.text = "Playing" }
+            .onProgress   { [weak self] s in self?.scrubber.value = Float(s) /* / duration */ }
+            .onPlaybackError { [weak self] error in
+                self?.statusLabel.text = error.localizedDescription
+            }
+    }
+}
+```
+
+The `handle` is created once and survives `rootView` reassignment, so seeking
+keeps working as you rebuild the view for pause/state changes.
+
+### AppKit
+
+Identical pattern with `NSHostingController`:
+
+```swift
+import AppKit
+import SwiftUI
+import TStreamKit
+
+let hosting = NSHostingController(
+    rootView: TStreamPlayerView(url: url)
+        .handle(handle)
+        .onPlaybackError { print($0.localizedDescription) }
+)
+// add hosting.view to your window/content view, or present it.
+window.contentViewController = hosting
 ```
 
 ### Diagnostics
@@ -110,7 +309,7 @@ in `Info.plist` (or `NSAllowsArbitraryLoads` for testing):
 <dict>
   <key>NSExceptionDomains</key>
   <dict>
-    <key>tvheadend.local</key>
+    <key>your-stream-host.local</key>
     <dict><key>NSExceptionAllowsInsecureHTTPLoads</key><true/></dict>
   </dict>
 </dict>
@@ -133,9 +332,14 @@ in `Info.plist` (or `NSAllowsArbitraryLoads` for testing):
 - Video is decoded in software; HEVC/UHD works but is the heaviest case.
 - Anamorphic SD aspect ratios and PAFF interlacing are handled.
 
+Seeking is supported for **recordings** (approximate, GOP-accurate — see
+[Seeking & progress](#seeking--progress-recordings)); live streams have no end
+to seek within.
+
 **Not supported:** AC-4 (no decoder exists on Apple platforms or in FFmpeg),
-DRM/encrypted streams, subtitles/teletext, and seeking/scrubbing — this is a
-live player, not a VOD/DVR engine.
+DRM/encrypted streams, and subtitles/teletext. Frame-accurate scrubbing is out
+of scope — this targets live and simple recording playback, not a full VOD/DVR
+engine.
 
 ## LGPL compliance
 
