@@ -22,7 +22,15 @@ final class TStreamSampleBufferPlayer: NSObject {
     private let synchronizer = AVSampleBufferRenderSynchronizer()
     private let audioRenderer = AVSampleBufferAudioRenderer()
     private let source: TSDemuxSource
+    /// Serializes video decode + display drain + all playback state.
     private let renderQueue = DispatchQueue(label: "com.tstream.render")
+    /// Serializes the audio drain so refilling the audio renderer is never
+    /// blocked behind a slow libavcodec video decode on `renderQueue` — under
+    /// sustained HD load (and thermal throttling) that starved the renderer and
+    /// produced the intermittent audio dropouts. All audio-only state below
+    /// (`audioQueue`, `audioRequesting`, `audioFormatDesc`, `audioStopped`,
+    /// `audioGateOpen`) is confined to this queue.
+    private let audioRenderQueue = DispatchQueue(label: "com.tstream.audio")
 
     private let videoTimescale: CMTimeScale = 90_000
 
@@ -31,9 +39,17 @@ final class TStreamSampleBufferPlayer: NSObject {
     private var videoQueue: [CMSampleBuffer] = []
     private var sawVideo = false
 
-    // Audio: compressed AAC/AC-3 → system audio renderer.
+    // Audio: compressed AAC/AC-3 → system audio renderer. Confined to
+    // `audioRenderQueue`.
     private var audioFormatDesc: CMAudioFormatDescription?
     private var audioQueue: [CMSampleBuffer] = []
+    /// Audio-side mirror of `stopped`, set on `audioRenderQueue`.
+    private var audioStopped = false
+    /// Gates audio ingest: audio only flows once video has been seen, and is
+    /// closed again on seek until the first post-seek keyframe reopens it. This
+    /// is the audio-queue-local stand-in for `sawVideo` + `discardingUntilSeek`,
+    /// which live on `renderQueue`. Toggled via `openAudioGate` / `closeAudioGate`.
+    private var audioGateOpen = false
 
     private var clockStarted = false
     /// User-initiated pause (distinct from the backpressure source pause). While
@@ -118,7 +134,7 @@ final class TStreamSampleBufferPlayer: NSObject {
             guard self.clockStarted else { return }
             self.synchronizer.rate = 1
             self.armVideo()
-            self.armAudio()
+            self.audioRenderQueue.async { self.armAudio() }
             self.scheduleResumeCheck()
         }
     }
@@ -152,11 +168,11 @@ final class TStreamSampleBufferPlayer: NSObject {
         }
         synchronizer.rate = 0
         displayLayer.stopRequestingMediaData(); videoRequesting = false
-        audioRenderer.stopRequestingMediaData(); audioRequesting = false
         displayLayer.flush()
-        audioRenderer.flush()
         videoQueue.removeAll()
-        audioQueue.removeAll()
+        // Audio state lives on its own queue; flush it there and close the gate
+        // so no stale pre-seek audio plays until the first post-seek keyframe.
+        closeAudioGate(flush: true)
         ffDecoder = nil          // fresh decoder waits for the next keyframe
         clockStarted = false
         firstVideoPTS = nil
@@ -175,15 +191,19 @@ final class TStreamSampleBufferPlayer: NSObject {
                 self.progressObserver = nil
             }
             self.displayLayer.stopRequestingMediaData()
-            self.audioRenderer.stopRequestingMediaData()
             self.videoRequesting = false
-            self.audioRequesting = false
             self.videoQueue.removeAll()
-            self.audioQueue.removeAll()
             self.synchronizer.setRate(0, time: .invalid)
             self.displayLayer.flushAndRemoveImage()
-            self.audioRenderer.flush()
             self.ffDecoder = nil
+        }
+        audioRenderQueue.async {
+            self.audioStopped = true
+            self.audioGateOpen = false
+            self.audioRenderer.stopRequestingMediaData()
+            self.audioRequesting = false
+            self.audioQueue.removeAll()
+            self.audioRenderer.flush()
             self.audioFormatDesc = nil
         }
         source.stop()
@@ -212,13 +232,15 @@ final class TStreamSampleBufferPlayer: NSObject {
         }
     }
 
+    /// Runs on `audioRenderQueue` so a slow video decode on `renderQueue` can
+    /// never delay refilling the audio renderer.
     private func armAudio() {
-        guard !stopped, !audioRequesting else { return }
+        guard !audioStopped, !audioRequesting else { return }
         audioRequesting = true
-        audioRenderer.requestMediaDataWhenReady(on: renderQueue) { [weak self] in
+        audioRenderer.requestMediaDataWhenReady(on: audioRenderQueue) { [weak self] in
             guard let self else { return }
             while self.audioRenderer.isReadyForMoreMediaData {
-                guard !self.stopped else {
+                guard !self.audioStopped else {
                     self.audioRenderer.stopRequestingMediaData()
                     self.audioRequesting = false
                     return
@@ -230,6 +252,23 @@ final class TStreamSampleBufferPlayer: NSObject {
                 }
                 self.audioRenderer.enqueue(self.audioQueue.removeFirst())
             }
+        }
+    }
+
+    /// Open/close the audio gate (on `audioRenderQueue`). Closing optionally
+    /// flushes the renderer and drops any buffered audio — used on seek/stop.
+    private func openAudioGate() {
+        audioRenderQueue.async { self.audioGateOpen = true }
+    }
+
+    private func closeAudioGate(flush: Bool) {
+        audioRenderQueue.async {
+            self.audioGateOpen = false
+            guard flush else { return }
+            self.audioRenderer.stopRequestingMediaData()
+            self.audioRequesting = false
+            self.audioRenderer.flush()
+            self.audioQueue.removeAll()
         }
     }
 
@@ -305,21 +344,21 @@ extension TStreamSampleBufferPlayer: TSDemuxerDelegate {
 
     func demuxer(_ d: TSDemuxer, didParseAudioFormat format: AudioFormat) {
         let desc = Self.makeAudioFormatDescription(format)
-        renderQueue.async { [weak self] in
-            guard let self, !self.stopped else { return }
+        audioRenderQueue.async { [weak self] in
+            guard let self, !self.audioStopped else { return }
             self.audioFormatDesc = desc
         }
     }
 
     func demuxer(_ d: TSDemuxer, didProduceAudio unit: AccessUnit) {
-        renderQueue.async { [weak self] in self?.ingestAudio(unit) }
+        audioRenderQueue.async { [weak self] in self?.ingestAudio(unit) }
     }
 
     func demuxer(_ d: TSDemuxer, didFail error: TStreamError) {
         DispatchQueue.main.async { [weak self] in self?.onError?(error) }
     }
 
-    // MARK: ingest (on renderQueue)
+    // MARK: ingest (video on renderQueue, audio on audioRenderQueue)
 
     private func ingestRawVideo(_ data: Data, codec: VideoCodec, pts: UInt64, dts: UInt64) {
         guard !stopped, !discardingUntilSeek else { return }
@@ -331,7 +370,7 @@ extension TStreamSampleBufferPlayer: TSDemuxerDelegate {
             }
         }
         guard let ffDecoder else { return }
-        sawVideo = true
+        if !sawVideo { sawVideo = true; openAudioGate() }
         for frame in ffDecoder.decode(data, pts: Int64(pts), dts: Int64(dts)) {
             enqueueVideoFrame(frame)
         }
@@ -353,9 +392,10 @@ extension TStreamSampleBufferPlayer: TSDemuxerDelegate {
         updateBackpressure()
     }
 
+    /// On `audioRenderQueue`. `audioGateOpen` stands in for `sawVideo` +
+    /// `discardingUntilSeek`: it opens once video is seen and closes on seek.
     private func ingestAudio(_ unit: AccessUnit) {
-        guard !stopped, !discardingUntilSeek else { return }
-        guard sawVideo, let desc = audioFormatDesc else { return }
+        guard !audioStopped, audioGateOpen, let desc = audioFormatDesc else { return }
         guard let sample = Self.makeCompressedSampleBuffer(
             data: unit.data, formatDescription: desc,
             pts: CMTime(value: Int64(unit.pts), timescale: videoTimescale)) else { return }
