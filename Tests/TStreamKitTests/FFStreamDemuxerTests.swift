@@ -65,15 +65,37 @@ final class FFStreamDemuxerTests: XCTestCase {
         XCTAssertEqual(spy.audioFormats.first?.codec, .aac)
     }
 
-    /// VP8 video is reported; Vorbis audio is not, because it needs decoding to
-    /// PCM first. Video must still play rather than the whole stream failing.
-    func testPlaysWebMVideoAndSkipsVorbisAudio() throws {
+    /// H.264 with Vorbis in MP4. Vorbis has to be decoded whatever container it
+    /// turns up in, so this covers the same audio path through a different
+    /// demuxer than the WebM case.
+    func testPlaysMP4WithVorbisAudio() throws {
+        let spy = play(try fixture("probe-vorbis", "mp4"), contentType: "video/mp4")
+
+        XCTAssertEqual(spy.errors, [])
+        XCTAssertEqual(spy.videoFormats.first?.codec, .h264)
+        XCTAssertGreaterThan(spy.video.count, 10)
+        XCTAssertEqual(spy.audioFormats.first?.codec, .pcm)
+        XCTAssertGreaterThan(spy.audio.reduce(0) { $0 + $1.data.count }, 10_000)
+    }
+
+    /// WebM carries VP8 and Vorbis, neither of which the system can take
+    /// directly. Vorbis is decoded here, so the player is handed plain PCM.
+    func testPlaysWebMWithVP8AndDecodedVorbis() throws {
         let spy = play(try fixture("probe", "webm"), contentType: "video/webm")
 
         XCTAssertEqual(spy.errors, [])
         XCTAssertEqual(spy.videoFormats.first?.codec, .vp8)
         XCTAssertGreaterThan(spy.video.count, 10)
-        XCTAssertEqual(spy.audioFormats.count, 0, "Vorbis has no PCM path yet")
+
+        XCTAssertEqual(spy.audioFormats.first?.codec, .pcm)
+        XCTAssertEqual(spy.audioFormats.first?.sampleRate, 44100)
+        XCTAssertEqual(spy.audioFormats.first?.channels, 2)
+
+        // One second of 44.1 kHz stereo is 44100 frames at 4 bytes each. Allow
+        // slack for however much of the clip drained before we stopped.
+        let bytes = spy.audio.reduce(0) { $0 + $1.data.count }
+        XCTAssertGreaterThan(bytes, 44100 * 4 / 4, "too little PCM came out: \(bytes) bytes")
+        XCTAssertLessThanOrEqual(bytes, 44100 * 4 * 2)
     }
 
     /// The packets have to survive the whole way into pixels. This is the part

@@ -52,6 +52,9 @@ final class TStreamSampleBufferPlayer: NSObject {
     private var audioQueue: [CMSampleBuffer] = []
     /// Audio-side mirror of `stopped`, set on `audioRenderQueue`.
     private var audioStopped = false
+    /// Whether the audio arriving is already-decoded PCM rather than compressed
+    /// packets. Confined to `audioRenderQueue` with the rest of the audio state.
+    private var isPCMAudio = false
     /// Gates audio ingest: audio only flows once video has been seen, and is
     /// closed again on seek until the first post-seek keyframe reopens it. This
     /// is the audio-queue-local stand-in for `sawVideo` + `discardingUntilSeek`,
@@ -357,9 +360,11 @@ extension TStreamSampleBufferPlayer: MediaSourceDelegate {
 
     func mediaSource(_ s: MediaSource, didParseAudioFormat format: AudioFormat) {
         let desc = Self.makeAudioFormatDescription(format)
+        let isPCM = format.codec == .pcm
         audioRenderQueue.async { [weak self] in
             guard let self, !self.audioStopped else { return }
             self.audioFormatDesc = desc
+            self.isPCMAudio = isPCM
         }
     }
 
@@ -411,9 +416,13 @@ extension TStreamSampleBufferPlayer: MediaSourceDelegate {
     /// `discardingUntilSeek`: it opens once video is seen and closes on seek.
     private func ingestAudio(_ unit: AccessUnit) {
         guard !audioStopped, audioGateOpen, let desc = audioFormatDesc else { return }
-        guard let sample = Self.makeCompressedSampleBuffer(
-            data: unit.data, formatDescription: desc,
-            pts: CMTime(value: Int64(unit.pts), timescale: videoTimescale)) else { return }
+        let pts = CMTime(value: Int64(unit.pts), timescale: videoTimescale)
+        // PCM arrives as many sample frames in one blob, so it has to be
+        // described as such rather than as a single compressed packet.
+        let sample = isPCMAudio
+            ? Self.makePCMSampleBuffer(data: unit.data, formatDescription: desc, pts: pts)
+            : Self.makeCompressedSampleBuffer(data: unit.data, formatDescription: desc, pts: pts)
+        guard let sample else { return }
         audioQueue.append(sample)
         armAudio()
     }
@@ -445,6 +454,16 @@ private extension TStreamSampleBufferPlayer {
         // `dac3` box is MP4-only and is not a Core Audio cookie).
         var cookie: [UInt8] = []
         switch format.codec {
+        case .pcm:
+            // Already decoded, interleaved signed 16-bit. One frame per packet,
+            // so the renderer can take any number of them at once.
+            let bytesPerFrame = UInt32(2 * max(format.channels, 1))
+            asbd.mFormatID = kAudioFormatLinearPCM
+            asbd.mFormatFlags = kAudioFormatFlagIsSignedInteger | kAudioFormatFlagIsPacked
+            asbd.mBitsPerChannel = 16
+            asbd.mFramesPerPacket = 1
+            asbd.mBytesPerFrame = bytesPerFrame
+            asbd.mBytesPerPacket = bytesPerFrame
         case .ac3:
             asbd.mFormatID = kAudioFormatAC3
             asbd.mFramesPerPacket = UInt32(format.samplesPerFrame)   // 1536
@@ -465,6 +484,49 @@ private extension TStreamSampleBufferPlayer {
                 extensions: nil, formatDescriptionOut: &desc)
         }
         return desc
+    }
+
+    /// Wraps interleaved PCM. Unlike a compressed packet this is many sample
+    /// frames of equal size, so the buffer is described as `frames` samples of
+    /// `bytesPerFrame` each and given a real duration.
+    static func makePCMSampleBuffer(data: Data, formatDescription: CMFormatDescription, pts: CMTime) -> CMSampleBuffer? {
+        guard let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(formatDescription)?.pointee,
+              asbd.mBytesPerFrame > 0 else { return nil }
+        let bytesPerFrame = Int(asbd.mBytesPerFrame)
+        let frames = data.count / bytesPerFrame
+        guard frames > 0 else { return nil }
+
+        guard let blockBuffer = makeBlockBuffer(data.prefix(frames * bytesPerFrame)) else { return nil }
+
+        var timing = CMSampleTimingInfo(
+            duration: CMTime(value: 1, timescale: CMTimeScale(asbd.mSampleRate)),
+            presentationTimeStamp: pts,
+            decodeTimeStamp: .invalid)
+        var sampleSize = bytesPerFrame
+        var sampleBuffer: CMSampleBuffer?
+        guard CMSampleBufferCreate(
+            allocator: kCFAllocatorDefault, dataBuffer: blockBuffer, dataReady: true,
+            makeDataReadyCallback: nil, refcon: nil, formatDescription: formatDescription,
+            sampleCount: frames, sampleTimingEntryCount: 1, sampleTimingArray: &timing,
+            sampleSizeEntryCount: 1, sampleSizeArray: &sampleSize,
+            sampleBufferOut: &sampleBuffer) == noErr else { return nil }
+        return sampleBuffer
+    }
+
+    /// Copies `data` into a CMBlockBuffer that owns its memory.
+    static func makeBlockBuffer(_ data: Data) -> CMBlockBuffer? {
+        let bytes = [UInt8](data)
+        var blockBuffer: CMBlockBuffer?
+        var status = CMBlockBufferCreateWithMemoryBlock(
+            allocator: kCFAllocatorDefault, memoryBlock: nil, blockLength: bytes.count,
+            blockAllocator: kCFAllocatorDefault, customBlockSource: nil,
+            offsetToData: 0, dataLength: bytes.count, flags: 0, blockBufferOut: &blockBuffer)
+        guard status == kCMBlockBufferNoErr, let blockBuffer else { return nil }
+        status = bytes.withUnsafeBytes {
+            CMBlockBufferReplaceDataBytes(with: $0.baseAddress!, blockBuffer: blockBuffer,
+                                          offsetIntoDestination: 0, dataLength: bytes.count)
+        }
+        return status == kCMBlockBufferNoErr ? blockBuffer : nil
     }
 
     static func makeCompressedSampleBuffer(data: Data, formatDescription: CMFormatDescription, pts: CMTime) -> CMSampleBuffer? {

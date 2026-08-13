@@ -36,6 +36,7 @@ final class MediaSourceSpy: MediaSourceDelegate {
     var videoData: [Data] = []
     var videoFormats: [(codec: VideoCodec, extradata: Data?)] = []
     var audioFormats: [AudioFormat] = []
+    var audio: [AccessUnit] = []
     var errors: [TStreamError] = []
     let received = XCTestExpectation(description: "source produced output")
 
@@ -51,7 +52,9 @@ final class MediaSourceSpy: MediaSourceDelegate {
     func mediaSource(_ s: MediaSource, didParseAudioFormat format: AudioFormat) {
         audioFormats.append(format)
     }
-    func mediaSource(_ s: MediaSource, didProduceAudio unit: AccessUnit) {}
+    func mediaSource(_ s: MediaSource, didProduceAudio unit: AccessUnit) {
+        audio.append(unit)
+    }
     func mediaSource(_ s: MediaSource, didFail error: TStreamError) {
         errors.append(error)
         received.fulfill()

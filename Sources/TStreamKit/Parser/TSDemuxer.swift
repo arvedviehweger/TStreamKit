@@ -1,7 +1,10 @@
 import Foundation
 
 enum VideoCodec: Sendable { case h264, h265, mpeg2, vp8 }
-enum AudioCodec: Sendable { case aac, ac3, eac3, mp2 }
+/// `pcm` is not a transport codec: it means the audio was already decoded to
+/// interleaved signed 16-bit PCM, because Core Audio cannot take it compressed
+/// (Vorbis, Opus).
+enum AudioCodec: Sendable { case aac, ac3, eac3, mp2, pcm }
 enum VideoSyncType: Sendable { case none, idr, nonIDRIntra }
 
 /// Decoder configuration for the video elementary stream.
@@ -545,6 +548,7 @@ final class TSDemuxer {
         case .ac3: completeAC3(elementary, header: header)
         case .eac3: completeEAC3(elementary, header: header)
         case .mp2: mp2Transcoder.consume(elementary, pts: header.pts)
+        case .pcm: break     // only produced by the container path, never in TS
         case .none: break
         }
     }

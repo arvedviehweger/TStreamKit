@@ -22,6 +22,12 @@ ffmpeg -f lavfi -i testsrc=size=128x96:rate=25:duration=1 \
        -f lavfi -i "sine=frequency=440:duration=1" \
        -c:v libx264 -pix_fmt yuv420p -g 25 -c:a aac -b:a 32k \
        -movflags frag_keyframe+empty_moov probe.mp4
+
+# Fragmented MP4, H.264 + Vorbis
+ffmpeg -f lavfi -i testsrc=size=128x96:rate=25:duration=1 \
+       -f lavfi -i "sine=frequency=440:duration=1" \
+       -c:v libx264 -pix_fmt yuv420p -g 25 -ac 2 -c:a vorbis -strict -2 -b:a 32k \
+       -movflags frag_keyframe+empty_moov probe-vorbis.mp4
 ```
 
 The MP4 is fragmented because that is the only form a live stream can take: a

@@ -184,14 +184,42 @@ final class FFStreamDemuxer: StreamDemuxer {
                 + "\(extradata?.count ?? 0) bytes of extradata")
         }
 
-        guard info.has_audio != 0, let format = Self.audioFormat(info) else {
-            if info.has_audio != 0 {
-                TStreamDiagnostics.log("ffdemux: audio codec \(info.audio_codec.rawValue) not supported, playing video only")
-            }
+        guard info.has_audio != 0 else { return }
+
+        if Self.needsDecoding(info.audio_codec) {
+            announceDecodedAudio(info)
+            return
+        }
+
+        guard let format = Self.audioFormat(info) else {
+            TStreamDiagnostics.log("ffdemux: audio codec \(info.audio_codec.rawValue) not supported, playing video only")
             return
         }
         output?.demuxerDidParseAudioFormat(format)
         TStreamDiagnostics.log("ffdemux: audio \(format.codec) \(format.sampleRate) Hz, \(format.channels) ch")
+    }
+
+    /// Sets up decoding for Vorbis or Opus and reports the PCM the player will
+    /// actually receive. The rate and channel count are taken from the decoder
+    /// once it is open, since that is the authority on what it produces.
+    private func announceDecodedAudio(_ info: CFFStreamInfo) {
+        let extradata = Self.data(info.audio_extradata, info.audio_extradata_size)
+        guard let decoder = TStreamFFAudioDecoder(codec: info.audio_codec,
+                                                  sampleRate: Int(info.audio_sample_rate),
+                                                  channels: Int(info.audio_channels),
+                                                  extradata: extradata) else {
+            TStreamDiagnostics.log("ffdemux: could not open the audio decoder, playing video only")
+            return
+        }
+        audioDecoder = decoder
+        let format = AudioFormat(codec: .pcm,
+                                 sampleRate: decoder.sampleRate,
+                                 channels: decoder.channels,
+                                 samplesPerFrame: 1,
+                                 decoderConfig: Data())
+        output?.demuxerDidParseAudioFormat(format)
+        TStreamDiagnostics.log(
+            "ffdemux: audio decoded to PCM, \(decoder.sampleRate) Hz, \(decoder.channels) ch")
     }
 
     private func emit(_ packet: CFFPacket) {
@@ -206,6 +234,11 @@ final class FFStreamDemuxer: StreamDemuxer {
         if packet.is_video != 0 {
             guard let codec = videoCodecForPackets else { return }
             output?.demuxerDidProduceVideo(data, codec: codec, pts: pts, dts: dts)
+        } else if let audioDecoder {
+            for block in audioDecoder.decode(data, pts: pts) {
+                output?.demuxerDidProduceAudio(
+                    AccessUnit(data: block.data, pts: block.pts, dts: block.pts, isKeyframe: true))
+            }
         } else {
             output?.demuxerDidProduceAudio(
                 AccessUnit(data: data, pts: pts, dts: dts, isKeyframe: true))
@@ -213,6 +246,9 @@ final class FFStreamDemuxer: StreamDemuxer {
     }
 
     private var videoCodecForPackets: VideoCodec?
+    /// Set only for codecs Core Audio cannot take, in which case audio packets
+    /// are decoded here and the player receives PCM.
+    private var audioDecoder: TStreamFFAudioDecoder?
 
     private func report(_ error: TStreamError) {
         output?.demuxerDidFail(error)
@@ -235,10 +271,9 @@ final class FFStreamDemuxer: StreamDemuxer {
         }
     }
 
-    /// Only the codecs the system decoder can take are reported here. Vorbis and
-    /// Opus need decoding to PCM first, and MP2 from a container would need the
-    /// transcode the TS path does, so those are left silent for now rather than
-    /// handed over in a shape the renderer would choke on.
+    /// Codecs Core Audio can take are passed through compressed. MP2 from a
+    /// container is left out: the TS path transcodes it, and feeding it raw
+    /// would not match what the renderer is set up for.
     private static func audioFormat(_ info: CFFStreamInfo) -> AudioFormat? {
         let sampleRate = Int(info.audio_sample_rate)
         let channels = Int(info.audio_channels)
@@ -261,5 +296,11 @@ final class FFStreamDemuxer: StreamDemuxer {
         default:
             return nil
         }
+    }
+
+    /// Codecs Core Audio cannot take get decoded here instead, and the player
+    /// sees plain PCM.
+    private static func needsDecoding(_ codec: CFFAudioCodec) -> Bool {
+        codec == CFF_AUDIO_VORBIS || codec == CFF_AUDIO_OPUS
     }
 }
