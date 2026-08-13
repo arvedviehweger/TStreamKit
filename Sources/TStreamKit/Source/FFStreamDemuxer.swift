@@ -195,8 +195,16 @@ final class FFStreamDemuxer: StreamDemuxer {
             TStreamDiagnostics.log("ffdemux: audio codec \(info.audio_codec.rawValue) not supported, playing video only")
             return
         }
+        let config = format.decoderConfig.map { String(format: "%02x", $0) }.joined()
+        let described = AudioSpecificConfig(parsing: format.decoderConfig)
+            .map { "object type \($0.objectType), \($0.sampleRate) Hz, \($0.channels) ch" }
+            ?? "not understood"
+        TStreamDiagnostics.log("""
+            ffdemux: audio \(format.codec) \(format.sampleRate) Hz, \(format.channels) ch, \
+            config \(config.isEmpty ? "none" : config) (\(described))
+            """)
+
         output?.demuxerDidParseAudioFormat(format)
-        TStreamDiagnostics.log("ffdemux: audio \(format.codec) \(format.sampleRate) Hz, \(format.channels) ch")
     }
 
     /// Sets up decoding for Vorbis or Opus and reports the PCM the player will

@@ -359,7 +359,7 @@ extension TStreamSampleBufferPlayer: MediaSourceDelegate {
     }
 
     func mediaSource(_ s: MediaSource, didParseAudioFormat format: AudioFormat) {
-        let desc = Self.makeAudioFormatDescription(format)
+        let desc = CoreAudioSupport.formatDescription(for: format)
         let isPCM = format.codec == .pcm
         audioRenderQueue.async { [weak self] in
             guard let self, !self.audioStopped else { return }
@@ -444,46 +444,6 @@ private extension TStreamSampleBufferPlayer {
             makeDataReadyCallback: nil, refcon: nil, formatDescription: formatDesc,
             sampleTiming: &timing, sampleBufferOut: &sampleBuffer) == noErr else { return nil }
         return sampleBuffer
-    }
-
-    static func makeAudioFormatDescription(_ format: AudioFormat) -> CMAudioFormatDescription? {
-        var asbd = AudioStreamBasicDescription()
-        asbd.mSampleRate = Float64(format.sampleRate)
-        asbd.mChannelsPerFrame = UInt32(max(format.channels, 1))
-        // AAC/MP2 use an AudioSpecificConfig magic cookie; AC-3 takes none (the
-        // `dac3` box is MP4-only and is not a Core Audio cookie).
-        var cookie: [UInt8] = []
-        switch format.codec {
-        case .pcm:
-            // Already decoded, interleaved signed 16-bit. One frame per packet,
-            // so the renderer can take any number of them at once.
-            let bytesPerFrame = UInt32(2 * max(format.channels, 1))
-            asbd.mFormatID = kAudioFormatLinearPCM
-            asbd.mFormatFlags = kAudioFormatFlagIsSignedInteger | kAudioFormatFlagIsPacked
-            asbd.mBitsPerChannel = 16
-            asbd.mFramesPerPacket = 1
-            asbd.mBytesPerFrame = bytesPerFrame
-            asbd.mBytesPerPacket = bytesPerFrame
-        case .ac3:
-            asbd.mFormatID = kAudioFormatAC3
-            asbd.mFramesPerPacket = UInt32(format.samplesPerFrame)   // 1536
-        case .eac3:
-            asbd.mFormatID = kAudioFormatEnhancedAC3
-            asbd.mFramesPerPacket = UInt32(format.samplesPerFrame)   // blocks × 256
-        case .aac, .mp2:
-            asbd.mFormatID = kAudioFormatMPEG4AAC
-            asbd.mFormatFlags = UInt32(MPEG4ObjectID.AAC_LC.rawValue)
-            asbd.mFramesPerPacket = 1024
-            cookie = [UInt8](format.decoderConfig)
-        }
-        var desc: CMAudioFormatDescription?
-        _ = cookie.withUnsafeBufferPointer { c in
-            CMAudioFormatDescriptionCreate(
-                allocator: kCFAllocatorDefault, asbd: &asbd, layoutSize: 0, layout: nil,
-                magicCookieSize: c.count, magicCookie: c.baseAddress,
-                extensions: nil, formatDescriptionOut: &desc)
-        }
-        return desc
     }
 
     /// Wraps interleaved PCM. Unlike a compressed packet this is many sample
