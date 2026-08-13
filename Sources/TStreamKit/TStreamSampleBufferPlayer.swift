@@ -86,7 +86,7 @@ final class TStreamSampleBufferPlayer: NSObject {
     private let lowWaterSeconds = 2.0
 
     convenience init(url: URL, headers: [String: String] = [:]) {
-        self.init(source: TSDemuxSource(httpURL: url, headers: headers))
+        self.init(source: HTTPMediaSource(url: url, headers: headers))
     }
 
     init(source: MediaSource) {
