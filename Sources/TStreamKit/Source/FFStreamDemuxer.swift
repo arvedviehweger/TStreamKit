@@ -204,12 +204,25 @@ final class FFStreamDemuxer: StreamDemuxer {
             config \(config.isEmpty ? "none" : config) (\(described))
             """)
 
+        // Core Audio does not decode every AAC profile: AAC Main is refused
+        // whatever we describe it as. Ask before committing to passing packets
+        // through, because the refusal otherwise surfaces only in the renderer,
+        // as silence over playing video.
+        if format.codec == .aac, !CoreAudioSupport.canDecode(format) {
+            TStreamDiagnostics.log("ffdemux: the system decoder will not take this AAC, decoding it here")
+            announceDecodedAudio(info)
+            return
+        }
+
         output?.demuxerDidParseAudioFormat(format)
     }
 
-    /// Sets up decoding for Vorbis or Opus and reports the PCM the player will
-    /// actually receive. The rate and channel count are taken from the decoder
-    /// once it is open, since that is the authority on what it produces.
+    /// Sets up decoding here rather than in the renderer, and reports the PCM
+    /// the player will actually receive. Used for Vorbis and Opus, which Core
+    /// Audio has no decoder for, and for the AAC profiles it turns down.
+    ///
+    /// The rate and channel count come from the decoder once it is open, since
+    /// that is the authority on what it produces.
     private func announceDecodedAudio(_ info: CFFStreamInfo) {
         let extradata = Self.data(info.audio_extradata, info.audio_extradata_size)
         guard let decoder = TStreamFFAudioDecoder(codec: info.audio_codec,

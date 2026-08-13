@@ -2,13 +2,46 @@ import AudioToolbox
 import CoreMedia
 import Foundation
 
-/// Describes audio to Core Audio.
+/// Describes audio to Core Audio, and answers whether Core Audio can actually
+/// take it.
 ///
-/// Building a description validates almost nothing:
-/// `CMAudioFormatDescriptionCreate` returns one for configurations the codec
-/// later refuses, and that refusal surfaces deep inside the renderer as silence
-/// rather than as an error anyone can catch.
+/// The second question has to be asked out loud. Building a format description
+/// validates almost nothing: `CMAudioFormatDescriptionCreate` returns a
+/// description for configurations the codec later refuses, and that refusal
+/// surfaces deep inside the renderer as silence rather than as an error anyone
+/// can catch. Opening a decoder is the only honest test.
 enum CoreAudioSupport {
+
+    /// Whether the system decoder can be set up for this format.
+    ///
+    /// Worth asking for AAC, where support depends on the profile: AAC Main is
+    /// refused outright, so a stream carrying it has to be decoded elsewhere.
+    static func canDecode(_ format: AudioFormat) -> Bool {
+        guard let description = formatDescription(for: format),
+              var input = CMAudioFormatDescriptionGetStreamBasicDescription(description)?.pointee
+        else { return false }
+
+        var output = AudioStreamBasicDescription()
+        output.mSampleRate = input.mSampleRate
+        output.mFormatID = kAudioFormatLinearPCM
+        output.mFormatFlags = kAudioFormatFlagIsSignedInteger | kAudioFormatFlagIsPacked
+        output.mChannelsPerFrame = max(input.mChannelsPerFrame, 1)
+        output.mBitsPerChannel = 16
+        output.mFramesPerPacket = 1
+        output.mBytesPerFrame = 2 * output.mChannelsPerFrame
+        output.mBytesPerPacket = output.mBytesPerFrame
+
+        var converter: AudioConverterRef?
+        guard AudioConverterNew(&input, &output, &converter) == noErr,
+              let converter else { return false }
+        defer { AudioConverterDispose(converter) }
+
+        var size = 0
+        guard let cookie = CMAudioFormatDescriptionGetMagicCookie(description, sizeOut: &size),
+              size > 0 else { return true }
+        return AudioConverterSetProperty(converter, kAudioConverterDecompressionMagicCookie,
+                                         UInt32(size), cookie) == noErr
+    }
 
     static func formatDescription(for format: AudioFormat) -> CMAudioFormatDescription? {
         var asbd = AudioStreamBasicDescription()

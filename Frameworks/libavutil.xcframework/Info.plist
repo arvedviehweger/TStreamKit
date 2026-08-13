@@ -8,21 +8,7 @@
 			<key>BinaryPath</key>
 			<string>libavutil.framework/libavutil</string>
 			<key>LibraryIdentifier</key>
-			<string>ios-arm64</string>
-			<key>LibraryPath</key>
-			<string>libavutil.framework</string>
-			<key>SupportedArchitectures</key>
-			<array>
-				<string>arm64</string>
-			</array>
-			<key>SupportedPlatform</key>
-			<string>ios</string>
-		</dict>
-		<dict>
-			<key>BinaryPath</key>
-			<string>libavutil.framework/libavutil</string>
-			<key>LibraryIdentifier</key>
-			<string>tvos-arm64</string>
+			<string>tvos-arm64-simulator</string>
 			<key>LibraryPath</key>
 			<string>libavutil.framework</string>
 			<key>SupportedArchitectures</key>
@@ -31,6 +17,8 @@
 			</array>
 			<key>SupportedPlatform</key>
 			<string>tvos</string>
+			<key>SupportedPlatformVariant</key>
+			<string>simulator</string>
 		</dict>
 		<dict>
 			<key>BinaryPath</key>
@@ -66,7 +54,21 @@
 			<key>BinaryPath</key>
 			<string>libavutil.framework/libavutil</string>
 			<key>LibraryIdentifier</key>
-			<string>tvos-arm64-simulator</string>
+			<string>ios-arm64</string>
+			<key>LibraryPath</key>
+			<string>libavutil.framework</string>
+			<key>SupportedArchitectures</key>
+			<array>
+				<string>arm64</string>
+			</array>
+			<key>SupportedPlatform</key>
+			<string>ios</string>
+		</dict>
+		<dict>
+			<key>BinaryPath</key>
+			<string>libavutil.framework/libavutil</string>
+			<key>LibraryIdentifier</key>
+			<string>tvos-arm64</string>
 			<key>LibraryPath</key>
 			<string>libavutil.framework</string>
 			<key>SupportedArchitectures</key>
@@ -75,8 +77,6 @@
 			</array>
 			<key>SupportedPlatform</key>
 			<string>tvos</string>
-			<key>SupportedPlatformVariant</key>
-			<string>simulator</string>
 		</dict>
 	</array>
 	<key>CFBundlePackageType</key>

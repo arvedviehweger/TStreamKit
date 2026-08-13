@@ -33,3 +33,11 @@ ffmpeg -f lavfi -i testsrc=size=128x96:rate=25:duration=1 \
 The MP4 is fragmented because that is the only form a live stream can take: a
 plain MP4 keeps its `moov` index at the end, so it cannot be played while it is
 still being written.
+
+`probe.adts` is half a second of 48 kHz mono AAC-LC as a raw bitstream, used to
+check that libavcodec really decodes AAC and not just that a decoder opens:
+
+```sh
+ffmpeg -f lavfi -i "sine=frequency=440:duration=0.5:sample_rate=48000" \
+       -ac 1 -c:a aac -b:a 32k -f adts probe.adts
+```
