@@ -21,7 +21,7 @@ final class TStreamSampleBufferPlayer: NSObject {
 
     private let synchronizer = AVSampleBufferRenderSynchronizer()
     private let audioRenderer = AVSampleBufferAudioRenderer()
-    private let source: TSDemuxSource
+    private let source: MediaSource
     /// Serializes video decode + display drain + all playback state.
     private let renderQueue = DispatchQueue(label: "com.tstream.render")
     /// Serializes the audio drain so refilling the audio renderer is never
@@ -85,10 +85,13 @@ final class TStreamSampleBufferPlayer: NSObject {
     private let highWaterSeconds = 4.0
     private let lowWaterSeconds = 2.0
 
-    init(url: URL, headers: [String: String] = [:]) {
-        self.source = TSDemuxSource(httpURL: url, headers: headers)
+    convenience init(url: URL, headers: [String: String] = [:]) {
+        self.init(source: TSDemuxSource(httpURL: url, headers: headers))
+    }
+
+    init(source: MediaSource) {
+        self.source = source
         super.init()
-        source.rawVideoMode = true
 
         synchronizer.addRenderer(audioRenderer)
         synchronizer.addRenderer(displayLayer)
@@ -140,19 +143,15 @@ final class TStreamSampleBufferPlayer: NSObject {
     }
 
     /// Seek to a fraction (0…1) of the recording. Approximate / GOP-accurate:
-    /// the byte offset is `fraction × totalBytes`, the source resyncs to the
-    /// next TS packet, and decoding resumes at the next keyframe. Absolute
-    /// position (`onProgress`) stays correct because it is anchored to
-    /// `streamStartPTS`, not the per-segment `firstVideoPTS`.
+    /// how the position is resolved is the source's business, and decoding
+    /// resumes at the next keyframe. Absolute position (`onProgress`) stays
+    /// correct because it is anchored to `streamStartPTS`, not the per-segment
+    /// `firstVideoPTS`. A live stream isn't seekable and this does nothing.
     func seek(toFraction fraction: Double) {
-        let f = min(max(fraction, 0), 1)
         renderQueue.async {
-            guard !self.stopped else { return }
-            let total = self.source.totalBytes
-            guard total > 0 else { return }
+            guard !self.stopped, self.source.isSeekable else { return }
             self.flushForSeek()
-            let offset = Int64(Double(total) * f)
-            self.source.seek(toByteOffset: offset) { [weak self] in
+            self.source.seek(toFraction: fraction) { [weak self] in
                 self?.renderQueue.async { self?.discardingUntilSeek = false }
             }
         }
@@ -333,16 +332,12 @@ final class TStreamSampleBufferPlayer: NSObject {
 
 // MARK: - Demuxer consumption
 
-extension TStreamSampleBufferPlayer: TSDemuxerDelegate {
-    // Raw-video mode: these two don't fire, but the protocol requires them.
-    func demuxer(_ d: TSDemuxer, didParseVideoFormat format: VideoFormat) {}
-    func demuxer(_ d: TSDemuxer, didProduceVideo unit: AccessUnit) {}
-
-    func demuxer(_ d: TSDemuxer, didProduceRawVideo data: Data, codec: VideoCodec, pts: UInt64, dts: UInt64) {
+extension TStreamSampleBufferPlayer: MediaSourceDelegate {
+    func mediaSource(_ s: MediaSource, didProduceVideo data: Data, codec: VideoCodec, pts: UInt64, dts: UInt64) {
         renderQueue.async { [weak self] in self?.ingestRawVideo(data, codec: codec, pts: pts, dts: dts) }
     }
 
-    func demuxer(_ d: TSDemuxer, didParseAudioFormat format: AudioFormat) {
+    func mediaSource(_ s: MediaSource, didParseAudioFormat format: AudioFormat) {
         let desc = Self.makeAudioFormatDescription(format)
         audioRenderQueue.async { [weak self] in
             guard let self, !self.audioStopped else { return }
@@ -350,11 +345,11 @@ extension TStreamSampleBufferPlayer: TSDemuxerDelegate {
         }
     }
 
-    func demuxer(_ d: TSDemuxer, didProduceAudio unit: AccessUnit) {
+    func mediaSource(_ s: MediaSource, didProduceAudio unit: AccessUnit) {
         audioRenderQueue.async { [weak self] in self?.ingestAudio(unit) }
     }
 
-    func demuxer(_ d: TSDemuxer, didFail error: TStreamError) {
+    func mediaSource(_ s: MediaSource, didFail error: TStreamError) {
         DispatchQueue.main.async { [weak self] in self?.onError?(error) }
     }
 

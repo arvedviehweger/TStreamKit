@@ -67,9 +67,14 @@ protocol TSDemuxerDelegate: AnyObject {
     func demuxer(_ demuxer: TSDemuxer, didProduceRawVideo data: Data, codec: VideoCodec, pts: UInt64, dts: UInt64)
 }
 
+// Everything except the audio and failure callbacks is optional: a raw-video
+// consumer (the player, via libavcodec) never sees parsed access units, and a
+// muxing consumer never sees raw video.
 extension TSDemuxerDelegate {
     func demuxer(_ demuxer: TSDemuxer, didIdentifyStreamsHasVideo hasVideo: Bool, hasAudio: Bool) {}
     func demuxer(_ demuxer: TSDemuxer, didProduceRawVideo data: Data, codec: VideoCodec, pts: UInt64, dts: UInt64) {}
+    func demuxer(_ demuxer: TSDemuxer, didParseVideoFormat format: VideoFormat) {}
+    func demuxer(_ demuxer: TSDemuxer, didProduceVideo unit: AccessUnit) {}
 }
 
 /// Consumes validated `TSPacket`s, resolves PAT/PMT, reassembles PES packets,

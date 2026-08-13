@@ -8,8 +8,8 @@ import Foundation
 /// non-IDR broadcast streams that derail AVPlayer's HLS decode path).
 ///
 /// All delegate callbacks are delivered on the private `queue`.
-final class TSDemuxSource: NSObject {
-    weak var delegate: TSDemuxerDelegate?
+final class TSDemuxSource: NSObject, MediaSource {
+    weak var delegate: MediaSourceDelegate?
     var onError: ((TStreamError) -> Void)?
 
     private let httpURL: URL
@@ -27,14 +27,23 @@ final class TSDemuxSource: NSObject {
     /// Byte offset of the current request (0 for the initial, non-ranged fetch).
     private var rangeOffset: Int64 = 0
     /// Total length of the resource in bytes, learned from the first response.
-    /// Used to translate a seek fraction into a byte offset. 0 until known.
-    private(set) var totalBytes: Int64 = 0
+    /// Used to translate a seek fraction into a byte offset. 0 until known —
+    /// a live stream never reports one, which is what makes it unseekable.
+    /// Written on `queue`, read from anywhere, so it takes a lock rather than a
+    /// `queue.sync` (which would deadlock if ever read from `queue` itself).
+    private var totalBytes: Int64 = 0
+    private let totalBytesLock = NSLock()
 
-    /// Forward raw video PES (for libavcodec) instead of parsed access units.
-    var rawVideoMode: Bool {
-        get { demuxer.rawVideoMode }
-        set { demuxer.rawVideoMode = newValue }
+    private func setTotalBytes(_ value: Int64) {
+        totalBytesLock.lock(); totalBytes = value; totalBytesLock.unlock()
     }
+
+    private func readTotalBytes() -> Int64 {
+        totalBytesLock.lock(); defer { totalBytesLock.unlock() }; return totalBytes
+    }
+
+    /// Only a finite resource (a recording) has a length to seek within.
+    var isSeekable: Bool { readTotalBytes() > 0 }
 
     init(httpURL: URL, headers: [String: String] = [:], configuration: URLSessionConfiguration = .default) {
         self.httpURL = httpURL
@@ -42,6 +51,9 @@ final class TSDemuxSource: NSObject {
         self.configuration = configuration
         super.init()
         demuxer.delegate = self
+        // The player decodes video with libavcodec, which does its own NAL and
+        // frame assembly, so we never need parsed access units.
+        demuxer.rawVideoMode = true
     }
 
     func start() {
@@ -52,12 +64,20 @@ final class TSDemuxSource: NSObject {
         }
     }
 
-    /// Seeks to a byte offset by cancelling the current download, resetting the
-    /// parser/demuxer (so they resync to the next TS packet and re-acquire
-    /// PAT/PMT), and re-issuing the request with an HTTP `Range` header. The
-    /// completion fires on the source queue *after* the new request has started
-    /// — the player uses it as a barrier to discard any in-flight pre-seek data.
-    func seek(toByteOffset offset: Int64, completion: @escaping () -> Void) {
+    /// Seeks by translating the fraction into a byte offset, cancelling the
+    /// current download, resetting the parser/demuxer (so they resync to the
+    /// next TS packet and re-acquire PAT/PMT), and re-issuing the request with
+    /// an HTTP `Range` header. Landing mid-packet is fine — that is exactly what
+    /// the parser's resync is for. The completion fires on the source queue
+    /// *after* the new request has started, so the player can use it as a
+    /// barrier to discard any in-flight pre-seek data.
+    func seek(toFraction fraction: Double, completion: @escaping () -> Void) {
+        let total = readTotalBytes()
+        // The completion must fire on every path: the player holds its decode
+        // gate shut until it does, so swallowing it here would freeze playback.
+        guard total > 0 else { queue.async(execute: completion); return }
+        let clamped = min(max(fraction, 0), 1)
+        let offset = Int64(Double(total) * clamped)
         queue.async {
             guard !self.stopped else { return }
             self.dataTask?.cancel()
@@ -155,7 +175,7 @@ extension TSDemuxSource: URLSessionDataDelegate {
         let expected = response.expectedContentLength
         queue.async { [weak self] in
             guard let self else { return }
-            if expected > 0 { self.totalBytes = self.rangeOffset + expected }
+            if expected > 0 { self.setTotalBytes(self.rangeOffset + expected) }
         }
         completionHandler(.allow)
     }
@@ -173,17 +193,21 @@ extension TSDemuxSource: URLSessionDataDelegate {
     }
 }
 
-// Forward the demuxer's output to the player.
+// Translate the TS demuxer's output into the container-neutral `MediaSource`
+// callbacks. The parsed-access-unit and stream-identification callbacks are
+// dropped: we run the demuxer in raw-video mode, and the player doesn't use
+// them. TS timestamps are already 90 kHz, so nothing needs rescaling.
 extension TSDemuxSource: TSDemuxerDelegate {
-    func demuxer(_ d: TSDemuxer, didParseVideoFormat format: VideoFormat) { delegate?.demuxer(d, didParseVideoFormat: format) }
-    func demuxer(_ d: TSDemuxer, didParseAudioFormat format: AudioFormat) { delegate?.demuxer(d, didParseAudioFormat: format) }
-    func demuxer(_ d: TSDemuxer, didProduceVideo unit: AccessUnit) { delegate?.demuxer(d, didProduceVideo: unit) }
-    func demuxer(_ d: TSDemuxer, didProduceAudio unit: AccessUnit) { delegate?.demuxer(d, didProduceAudio: unit) }
-    func demuxer(_ d: TSDemuxer, didFail error: TStreamError) { delegate?.demuxer(d, didFail: error) }
-    func demuxer(_ d: TSDemuxer, didIdentifyStreamsHasVideo v: Bool, hasAudio a: Bool) {
-        delegate?.demuxer(d, didIdentifyStreamsHasVideo: v, hasAudio: a)
-    }
     func demuxer(_ d: TSDemuxer, didProduceRawVideo data: Data, codec: VideoCodec, pts: UInt64, dts: UInt64) {
-        delegate?.demuxer(d, didProduceRawVideo: data, codec: codec, pts: pts, dts: dts)
+        delegate?.mediaSource(self, didProduceVideo: data, codec: codec, pts: pts, dts: dts)
+    }
+    func demuxer(_ d: TSDemuxer, didParseAudioFormat format: AudioFormat) {
+        delegate?.mediaSource(self, didParseAudioFormat: format)
+    }
+    func demuxer(_ d: TSDemuxer, didProduceAudio unit: AccessUnit) {
+        delegate?.mediaSource(self, didProduceAudio: unit)
+    }
+    func demuxer(_ d: TSDemuxer, didFail error: TStreamError) {
+        delegate?.mediaSource(self, didFail: error)
     }
 }
