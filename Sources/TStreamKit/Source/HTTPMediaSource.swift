@@ -4,7 +4,7 @@ import Foundation
 /// container the server sent, and runs the matching demuxer.
 ///
 /// Detection happens on the live connection rather than through a separate
-/// probe request. tvheadend starts a transcode session per connection, so
+/// probe request. A transcoding server starts a session per connection, so
 /// opening a second one to sniff would both cost a round trip and leave a
 /// stray session behind.
 ///
@@ -85,10 +85,7 @@ final class HTTPMediaSource: MediaSource {
             return
         }
 
-        guard let made = makeDemuxer(for: detected) else {
-            fail(.unsupportedCodec("\(describe(detected)) streams are not supported yet"))
-            return
-        }
+        let made = makeDemuxer(for: detected)
         made.output = self
         format = detected
         demuxer = made
@@ -99,10 +96,10 @@ final class HTTPMediaSource: MediaSource {
         made.consume(buffered)
     }
 
-    private func makeDemuxer(for format: ContainerFormat) -> StreamDemuxer? {
+    private func makeDemuxer(for format: ContainerFormat) -> StreamDemuxer {
         switch format {
         case .mpegTS: return TSStreamDemuxer()
-        case .matroska, .mp4: return nil    // libavformat path, not wired up yet
+        case .matroska, .mp4: return FFStreamDemuxer()
         }
     }
 
@@ -126,6 +123,9 @@ final class HTTPMediaSource: MediaSource {
 
 // Forward the demuxer's output to the player.
 extension HTTPMediaSource: StreamDemuxerOutput {
+    func demuxerDidParseVideoFormat(_ codec: VideoCodec, extradata: Data?) {
+        delegate?.mediaSource(self, didParseVideoFormat: codec, extradata: extradata)
+    }
     func demuxerDidProduceVideo(_ data: Data, codec: VideoCodec, pts: UInt64, dts: UInt64) {
         delegate?.mediaSource(self, didProduceVideo: data, codec: codec, pts: pts, dts: dts)
     }

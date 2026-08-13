@@ -38,6 +38,13 @@ final class TStreamSampleBufferPlayer: NSObject {
     private var ffDecoder: TStreamFFVideoDecoder?
     private var videoQueue: [CMSampleBuffer] = []
     private var sawVideo = false
+    /// Set once a container has described its video out of band, which also
+    /// means its packets arrive pre-framed. False for MPEG-TS, whose bytes are
+    /// a raw Annex-B stream. Both survive a seek, since the stream doesn't change.
+    private var videoIsPacketized = false
+    /// Codec setup record from that container. Can legitimately be nil even when
+    /// packetized: VP8 in WebM carries no setup record.
+    private var videoExtradata: Data?
 
     // Audio: compressed AAC/AC-3 → system audio renderer. Confined to
     // `audioRenderQueue`.
@@ -333,6 +340,17 @@ final class TStreamSampleBufferPlayer: NSObject {
 // MARK: - Demuxer consumption
 
 extension TStreamSampleBufferPlayer: MediaSourceDelegate {
+    func mediaSource(_ s: MediaSource, didParseVideoFormat codec: VideoCodec, extradata: Data?) {
+        renderQueue.async { [weak self] in
+            guard let self, !self.stopped else { return }
+            self.videoIsPacketized = true
+            self.videoExtradata = extradata
+            // A format can only arrive before the first packet, but rebuild
+            // anyway so a mid-stream format change can't decode with stale setup.
+            self.ffDecoder = nil
+        }
+    }
+
     func mediaSource(_ s: MediaSource, didProduceVideo data: Data, codec: VideoCodec, pts: UInt64, dts: UInt64) {
         renderQueue.async { [weak self] in self?.ingestRawVideo(data, codec: codec, pts: pts, dts: dts) }
     }
@@ -358,7 +376,9 @@ extension TStreamSampleBufferPlayer: MediaSourceDelegate {
     private func ingestRawVideo(_ data: Data, codec: VideoCodec, pts: UInt64, dts: UInt64) {
         guard !stopped, !discardingUntilSeek else { return }
         if ffDecoder == nil {
-            ffDecoder = TStreamFFVideoDecoder(codec: codec)
+            ffDecoder = TStreamFFVideoDecoder(codec: codec,
+                                              packetized: videoIsPacketized,
+                                              extradata: videoExtradata)
             if ffDecoder == nil {
                 DispatchQueue.main.async { [weak self] in self?.onError?(.unsupportedCodec("video decoder init failed")) }
                 return

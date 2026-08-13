@@ -18,14 +18,34 @@ final class TStreamFFVideoDecoder {
         let pts: Int64
     }
 
-    init?(codec: VideoCodec) {
+    /// `packetized` says the input is already framed by a container demuxer, so
+    /// each `decode` call carries exactly one packet and no parser runs. Raw
+    /// Annex-B input (MPEG-TS) leaves it false and gets parsed for frame
+    /// boundaries instead.
+    ///
+    /// This is deliberately separate from `extradata`: VP8 in WebM has no setup
+    /// record at all but is still packetized, and treating "no extradata" as
+    /// "needs a parser" would look for a VP8 parser that this build has no
+    /// reason to include.
+    init?(codec: VideoCodec, packetized: Bool = false, extradata: Data? = nil) {
         let id: CFFCodec
         switch codec {
         case .h264: id = CFF_CODEC_H264
         case .h265: id = CFF_CODEC_HEVC
         case .mpeg2: id = CFF_CODEC_MPEG2
+        case .vp8: id = CFF_CODEC_VP8
         }
-        guard let dec = cff_create(id) else { return nil }
+
+        let created: OpaquePointer?
+        if packetized {
+            let setup = extradata ?? Data()
+            created = setup.withUnsafeBytes { raw in
+                cff_create_packetized(id, raw.bindMemory(to: UInt8.self).baseAddress, Int32(raw.count))
+            }
+        } else {
+            created = cff_create(id)
+        }
+        guard let dec = created else { return nil }
         self.decoder = dec
     }
 

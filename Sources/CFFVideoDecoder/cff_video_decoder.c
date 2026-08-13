@@ -49,14 +49,22 @@ struct CFFVideoDecoder {
     int stat_w, stat_h, stat_interlaced;
 };
 
-CFFVideoDecoder *cff_create(CFFCodec codec) {
-    enum AVCodecID id;
+static enum AVCodecID codec_id_for(CFFCodec codec) {
     switch (codec) {
-        case CFF_CODEC_HEVC:  id = AV_CODEC_ID_HEVC; break;
-        case CFF_CODEC_MPEG2: id = AV_CODEC_ID_MPEG2VIDEO; break;
+        case CFF_CODEC_HEVC:  return AV_CODEC_ID_HEVC;
+        case CFF_CODEC_MPEG2: return AV_CODEC_ID_MPEG2VIDEO;
+        case CFF_CODEC_VP8:   return AV_CODEC_ID_VP8;
         case CFF_CODEC_H264:
-        default:              id = AV_CODEC_ID_H264; break;
+        default:              return AV_CODEC_ID_H264;
     }
+}
+
+// `use_parser` splits Annex-B input into frames; container-demuxed packets are
+// already framed and must skip it. `extradata` is copied into the context
+// before opening, which is how length-prefixed H.264 becomes decodable.
+static CFFVideoDecoder *create(CFFCodec codec, int use_parser,
+                               const uint8_t *extradata, int extradata_size) {
+    enum AVCodecID id = codec_id_for(codec);
     const AVCodec *avcodec = avcodec_find_decoder(id);
     if (!avcodec) return NULL;
 
@@ -64,12 +72,19 @@ CFFVideoDecoder *cff_create(CFFCodec codec) {
     if (!dec) return NULL;
 
     dec->ctx = avcodec_alloc_context3(avcodec);
-    dec->parser = av_parser_init(id);
     dec->packet = av_packet_alloc();
     dec->frame = av_frame_alloc();
-    if (!dec->ctx || !dec->parser || !dec->packet || !dec->frame) {
+    if (use_parser) dec->parser = av_parser_init(id);
+    if (!dec->ctx || !dec->packet || !dec->frame || (use_parser && !dec->parser)) {
         cff_destroy(dec);
         return NULL;
+    }
+
+    if (extradata && extradata_size > 0) {
+        dec->ctx->extradata = av_mallocz(extradata_size + AV_INPUT_BUFFER_PADDING_SIZE);
+        if (!dec->ctx->extradata) { cff_destroy(dec); return NULL; }
+        memcpy(dec->ctx->extradata, extradata, extradata_size);
+        dec->ctx->extradata_size = extradata_size;
     }
 
     dec->ctx->err_recognition = 0;
@@ -83,6 +98,14 @@ CFFVideoDecoder *cff_create(CFFCodec codec) {
         return NULL;
     }
     return dec;
+}
+
+CFFVideoDecoder *cff_create(CFFCodec codec) {
+    return create(codec, 1, NULL, 0);
+}
+
+CFFVideoDecoder *cff_create_packetized(CFFCodec codec, const uint8_t *extradata, int extradata_size) {
+    return create(codec, 0, extradata, extradata_size);
 }
 
 void cff_destroy(CFFVideoDecoder *dec) {
@@ -112,6 +135,19 @@ int cff_feed(CFFVideoDecoder *dec, const uint8_t *data, int size, int64_t pts, i
     memcpy(dec->inbuf, data, size);
     memset(dec->inbuf + size, 0, AV_INPUT_BUFFER_PADDING_SIZE);
     data = dec->inbuf;
+
+    // Container-demuxed input: already exactly one frame, so hand it straight
+    // to the decoder instead of looking for boundaries that aren't marked.
+    if (!dec->parser) {
+        dec->packet->data = dec->inbuf;
+        dec->packet->size = size;
+        dec->packet->pts = pts;
+        dec->packet->dts = dts;
+        (void)avcodec_send_packet(dec->ctx, dec->packet);
+        dec->packet->data = NULL;
+        dec->packet->size = 0;
+        return 0;
+    }
 
     while (size > 0) {
         int used = av_parser_parse2(dec->parser, dec->ctx,

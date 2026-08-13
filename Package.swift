@@ -55,7 +55,10 @@ let package = Package(
         .testTarget(
             name: "TStreamKitTests",
             dependencies: ["TStreamKit", "CFFVideoDecoder"],
-            path: "Tests/TStreamKitTests"
+            path: "Tests/TStreamKitTests",
+            // Short clips produced by ffmpeg, one per container a server can
+            // serve. See Fixtures/README.md for the commands that made them.
+            resources: [.copy("Fixtures")]
         ),
     ],
     // The demuxer/decoder/player are confined to single serial queues. We use

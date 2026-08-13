@@ -1,9 +1,10 @@
 import Foundation
 
-/// The container a stream arrives in. tvheadend can hand out any of its
-/// streaming profiles for the same channel (`pass` gives MPEG-TS, the `webtv-*`
-/// profiles give Matroska, WebM or MP4), and the client can't know in advance
-/// which one the server is configured for, so we detect it from the bytes.
+/// The container a stream arrives in. A server that transcodes can hand out the
+/// same channel under any of its streaming profiles (raw passthrough gives
+/// MPEG-TS, the web profiles give Matroska, WebM or MP4), and the client can't
+/// know in advance which one it is configured for, so we detect it from the
+/// bytes.
 enum ContainerFormat: Equatable {
     case mpegTS
     /// Matroska and WebM are the same container; only the codecs differ.

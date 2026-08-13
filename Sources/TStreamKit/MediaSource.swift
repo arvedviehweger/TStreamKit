@@ -36,7 +36,13 @@ protocol MediaSource: AnyObject {
 /// Output of a `MediaSource`. Timestamps are 90 kHz for every source — a
 /// container with a different time base rescales before reporting.
 protocol MediaSourceDelegate: AnyObject {
-    /// One chunk of the raw video elementary stream, for libavcodec to parse.
+    /// The container described its video before any packet arrived. `extradata`
+    /// is the codec setup record, which the decoder needs for length-prefixed
+    /// H.264 in Matroska and MP4. MPEG-TS carries its parameter sets in the
+    /// stream and never calls this.
+    func mediaSource(_ source: MediaSource, didParseVideoFormat codec: VideoCodec, extradata: Data?)
+    /// One chunk of the video stream. Annex-B bytes to be parsed when no format
+    /// was announced, otherwise exactly one already-framed packet.
     func mediaSource(_ source: MediaSource, didProduceVideo data: Data,
                      codec: VideoCodec, pts: UInt64, dts: UInt64)
     func mediaSource(_ source: MediaSource, didParseAudioFormat format: AudioFormat)

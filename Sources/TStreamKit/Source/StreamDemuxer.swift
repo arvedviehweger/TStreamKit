@@ -24,6 +24,11 @@ extension StreamDemuxer {
 
 /// What a `StreamDemuxer` emits. Timestamps are 90 kHz for every container.
 protocol StreamDemuxerOutput: AnyObject {
+    /// Reported before any video packet when the container describes its video
+    /// out of band. `extradata` is the codec setup record (avcC, hvcC, VP8
+    /// CodecPrivate). MPEG-TS carries this in the stream itself and never calls
+    /// this, which is what keeps its decode path unchanged.
+    func demuxerDidParseVideoFormat(_ codec: VideoCodec, extradata: Data?)
     func demuxerDidProduceVideo(_ data: Data, codec: VideoCodec, pts: UInt64, dts: UInt64)
     func demuxerDidParseAudioFormat(_ format: AudioFormat)
     func demuxerDidProduceAudio(_ unit: AccessUnit)

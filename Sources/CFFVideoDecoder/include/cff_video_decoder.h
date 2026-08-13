@@ -15,6 +15,7 @@ typedef enum {
     CFF_CODEC_H264 = 0,
     CFF_CODEC_HEVC = 1,
     CFF_CODEC_MPEG2 = 2,
+    CFF_CODEC_VP8 = 3,
 } CFFCodec;
 
 // One decoded frame in planar I420 (kCVPixelFormatType_420YpCbCr8Planar):
@@ -34,8 +35,21 @@ typedef struct {
     int v_stride;
 } CFFFrame;
 
-// Creates a decoder. Returns NULL on failure.
+// Creates a decoder for a raw (Annex-B) elementary stream, as MPEG-TS carries
+// it. Input is run through a parser that finds frame boundaries. Returns NULL
+// on failure.
 CFFVideoDecoder *cff_create(CFFCodec codec);
+
+// Creates a decoder for packets that a container demuxer already framed, where
+// `extradata` is the codec's setup record (avcC for H.264 in MP4/Matroska,
+// hvcC for HEVC, CodecPrivate for VP8). No parser runs: each cff_feed() call
+// must hand over exactly one packet.
+//
+// This is what makes length-prefixed H.264 work. In MP4 and Matroska the NAL
+// units carry a length prefix instead of a start code, and the parameter sets
+// live in the extradata rather than in the stream, so the decoder can only make
+// sense of it once the extradata is set. Pass NULL/0 to leave it unset.
+CFFVideoDecoder *cff_create_packetized(CFFCodec codec, const uint8_t *extradata, int extradata_size);
 
 void cff_destroy(CFFVideoDecoder *dec);
 

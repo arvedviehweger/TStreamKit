@@ -1,6 +1,6 @@
 import Foundation
 
-enum VideoCodec: Sendable { case h264, h265, mpeg2 }
+enum VideoCodec: Sendable { case h264, h265, mpeg2, vp8 }
 enum AudioCodec: Sendable { case aac, ac3, eac3, mp2 }
 enum VideoSyncType: Sendable { case none, idr, nonIDRIntra }
 
@@ -370,6 +370,7 @@ final class TSDemuxer {
         case .h264: completeH264(elementary, header: header)
         case .h265: completeH265(elementary, header: header)
         case .mpeg2: break   // MPEG-2 is decode-only (raw-video path); not muxed to fMP4
+        case .vp8: break     // only ever arrives via a container, never in TS
         case .none: break
         }
     }

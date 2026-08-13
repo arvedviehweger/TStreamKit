@@ -33,12 +33,19 @@ final class StubURLProtocol: URLProtocol {
 /// Collects what the source hands the player.
 final class MediaSourceSpy: MediaSourceDelegate {
     var video: [(codec: VideoCodec, pts: UInt64)] = []
+    var videoData: [Data] = []
+    var videoFormats: [(codec: VideoCodec, extradata: Data?)] = []
     var audioFormats: [AudioFormat] = []
     var errors: [TStreamError] = []
     let received = XCTestExpectation(description: "source produced output")
 
+    func mediaSource(_ s: MediaSource, didParseVideoFormat codec: VideoCodec, extradata: Data?) {
+        videoFormats.append((codec, extradata))
+    }
+
     func mediaSource(_ s: MediaSource, didProduceVideo data: Data, codec: VideoCodec, pts: UInt64, dts: UInt64) {
         video.append((codec, pts))
+        videoData.append(data)
         received.fulfill()
     }
     func mediaSource(_ s: MediaSource, didParseAudioFormat format: AudioFormat) {
@@ -52,7 +59,7 @@ final class MediaSourceSpy: MediaSourceDelegate {
 }
 
 final class HTTPMediaSourceTests: XCTestCase {
-    private let url = URL(string: "http://tvheadend.test/stream/channel/1")!
+    private let url = URL(string: "http://stream.test/channel/1")!
 
     override func tearDown() {
         StubURLProtocol.body = Data()
@@ -88,10 +95,10 @@ final class HTTPMediaSourceTests: XCTestCase {
         XCTAssertEqual(spy.video.first?.pts, 9000)
     }
 
-    /// A `webtv-*-matroska` profile. Until libavformat is wired up this must
-    /// report a clear reason rather than leaving the player on a black screen,
-    /// which is what happened before detection existed.
-    func testMatroskaReportsUnsupportedRatherThanStayingSilent() {
+    /// Content that announces itself as Matroska but is truncated must report a
+    /// reason rather than leaving the player on a black screen. Playable
+    /// Matroska is covered by FFStreamDemuxerTests.
+    func testBrokenMatroskaReportsAnErrorRatherThanStayingSilent() {
         var body: [UInt8] = [0x1A, 0x45, 0xDF, 0xA3]
         body += [UInt8](repeating: 0x00, count: 64)
         StubURLProtocol.body = Data(body)
@@ -106,10 +113,9 @@ final class HTTPMediaSourceTests: XCTestCase {
         source.stop()
 
         XCTAssertEqual(spy.video.count, 0)
-        guard case .unsupportedCodec(let message)? = spy.errors.first else {
-            return XCTFail("expected an unsupportedCodec error, got \(spy.errors)")
+        guard case .demux? = spy.errors.first else {
+            return XCTFail("expected a demux error, got \(spy.errors)")
         }
-        XCTAssertTrue(message.contains("Matroska"), "message should name the container: \(message)")
     }
 
     /// Bytes that are no container we know must fail rather than buffer forever.
