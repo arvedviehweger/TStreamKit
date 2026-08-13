@@ -13,10 +13,15 @@ tools like `ffmpeg`/`VLC` — directly on Apple devices, including the non-IDR,
 interlaced, open-GOP broadcast streams that `AVPlayer` chokes on. If your source
 can serve an MPEG-TS over HTTP(S), TStreamKit can play it.
 
+Servers that transcode rather than pass the mux through are covered too:
+**Matroska, WebM and fragmented MP4** are recognised from the stream itself, so
+a channel plays whichever profile it is served under.
+
 TStreamKit demuxes the transport stream itself and decodes video with a minimal,
 self-built **FFmpeg `libavcodec`** (software decode with error concealment and
-`bwdif` deinterlacing), rendering into an `AVSampleBufferDisplayLayer`. Audio is
-decoded by the system renderer. The result is smooth, broadcast-rate playback of
+`bwdif` deinterlacing), rendering into an `AVSampleBufferDisplayLayer`. Audio
+goes to the system renderer wherever Core Audio can decode it, and to
+`libavcodec` where it cannot. The result is smooth, broadcast-rate playback of
 German/European DVB and US ATSC channels that VideoToolbox-backed players can't
 handle.
 
@@ -37,26 +42,35 @@ handle.
   - [AppKit](#appkit)
   - [Diagnostics](#diagnostics)
   - [App Transport Security](#app-transport-security)
-- [Codec support](#codec-support)
+- [Container & codec support](#container--codec-support)
 - [LGPL compliance](#lgpl-compliance)
 - [License](#license)
 
 ## Pipeline
 
 ```
-HTTP MPEG-TS (DVB/ATSC gateway, SAT>IP, IPTV relay, ffmpeg, …)
+HTTP stream (DVB/ATSC gateway, SAT>IP, IPTV relay, transcoding server, …)
         │
         ▼
-TSPacketParser ──► TSDemuxer (PAT/PMT/PES, codec + descriptor detection)
-        │                       │
-   raw video PES            audio access units
-        ▼                       ▼
-libavcodec decode          AVSampleBufferAudioRenderer
-(concealment + bwdif)      (AAC / AC-3 / E-AC-3; MP2 → AAC)
-        ▼
-I420 CVPixelBuffer ──► AVSampleBufferDisplayLayer
+container recognised from the first bytes
         │
-        └──────► AVSampleBufferRenderSynchronizer (A/V sync)
+        ├─► MPEG-TS ──────────► TSPacketParser ──► TSDemuxer
+        │                                          (PAT/PMT/PES, descriptors)
+        └─► Matroska/WebM/MP4 ─► libavformat
+                                      │
+        ┌─────────────────────────────┴──────────────┐
+   video packets                               audio packets
+        ▼                                            ▼
+libavcodec decode                    AVSampleBufferAudioRenderer
+(concealment + bwdif)                (AAC / AC-3 / E-AC-3; MP2 → AAC)
+        │                                            │
+        │                              or libavcodec → PCM where
+        │                              Core Audio has no decoder
+        ▼                                            │
+I420 CVPixelBuffer ──► AVSampleBufferDisplayLayer    │
+        │                                            │
+        └──────► AVSampleBufferRenderSynchronizer ◄───┘
+                          (A/V sync)
 ```
 
 Video is decoded in software on purpose: VideoToolbox cannot robustly recover
@@ -315,20 +329,39 @@ in `Info.plist` (or `NSAllowsArbitraryLoads` for testing):
 </dict>
 ```
 
-## Codec support
+## Container & codec support
+
+| Container | Recognised by |
+|---|---|
+| MPEG-TS | 0x47 sync bytes at 188-byte strides |
+| Matroska, WebM | EBML magic |
+| MP4 (**fragmented**) | `ftyp` / `styp` / `moov` / `moof` |
+
+The container is read from the stream itself rather than from `Content-Type`,
+because servers mislabel it. Detection runs on the live connection, so no second
+request is made and no stray transcode session is left behind on the server. A
+plain MP4 keeps its index at the end and cannot be played while it is still
+being written, so a live stream has to be fragmented.
 
 | | Supported | Signaling |
 |---|---|---|
 | **Video** | H.264 (AVC), H.265 (HEVC), MPEG-2 | PMT 0x1B / 0x24 / 0x02 |
+| | VP8 | Matroska/WebM |
 | **Audio** | AAC (ADTS **and** LATM/LOAS) | PMT 0x0F / 0x11 |
 | | AC-3 (Dolby Digital) | ATSC 0x81 · DVB 0x06 + desc 0x6A |
 | | E-AC-3 (Dolby Digital Plus) | ATSC 0x87 · DVB 0x06 + desc 0x7A |
 | | MPEG-1/2 Layer II (MP2) → transcoded to AAC | PMT 0x03 / 0x04 |
+| | Vorbis → decoded to PCM | Matroska/WebM |
 
 - Both **ATSC** (US) and **DVB** (Europe) PMT signaling are recognized, including
   the DVB AC-3/E-AC-3 descriptors that don't use the ATSC stream types.
 - When a channel offers several audio tracks, Dolby is preferred
   (E-AC-3 > AC-3 > AAC/MP2), so the surround track wins where present.
+- Audio stays compressed all the way to the system renderer wherever Core Audio
+  can decode it. It has no decoder for **AAC Main**, which a transcoding server
+  can produce, so that arrives as PCM from `libavcodec` instead. Which path a
+  stream takes is decided by asking Core Audio rather than from a fixed list,
+  so it follows what the running OS and device actually support.
 - Video is decoded in software; HEVC/UHD works but is the heaviest case.
 - Anamorphic SD aspect ratios and PAFF interlacing are handled.
 
@@ -337,15 +370,16 @@ Seeking is supported for **recordings** (approximate, GOP-accurate — see
 to seek within.
 
 **Not supported:** AC-4 (no decoder exists on Apple platforms or in FFmpeg),
-DRM/encrypted streams, and subtitles/teletext. Frame-accurate scrubbing is out
-of scope — this targets live and simple recording playback, not a full VOD/DVR
-engine.
+Opus, VP9, AV1, DRM/encrypted streams, and subtitles/teletext. Frame-accurate
+scrubbing is out of scope — this targets live and simple recording playback, not
+a full VOD/DVR engine.
 
 ## LGPL compliance
 
-TStreamKit's own code is MIT-licensed. It links four FFmpeg libraries —
-`libavcodec`, `libavutil`, `libswscale`, `libavfilter` — which are licensed
-under the **GNU LGPL v3**. To keep distribution clean:
+TStreamKit's own code is MIT-licensed. It links six FFmpeg libraries —
+`libavcodec`, `libavformat`, `libavutil`, `libswscale`, `libswresample`,
+`libavfilter` — which are licensed under the **GNU LGPL v3**. To keep
+distribution clean:
 
 - **No GPL components.** FFmpeg is configured `--disable-gpl --enable-version3`,
   decode-only, no encoders/muxers/network. The exact configuration lives in
