@@ -48,6 +48,9 @@ final class FFStreamDemuxer: StreamDemuxer {
     /// seek has to rebuild the demuxer against the new byte position.
     func reset() {
         teardown()
+        // A seek breaks the PCM timeline; the next block re-anchors it.
+        pcmAnchor = nil
+        pcmSamples = 0
         condition.lock()
         buffer.removeAll(keepingCapacity: false)
         finished = false
@@ -233,6 +236,9 @@ final class FFStreamDemuxer: StreamDemuxer {
             return
         }
         audioDecoder = decoder
+        pcmSampleRate = decoder.sampleRate
+        pcmAnchor = nil
+        pcmSamples = 0
         let format = AudioFormat(codec: .pcm,
                                  sampleRate: decoder.sampleRate,
                                  channels: decoder.channels,
@@ -257,8 +263,9 @@ final class FFStreamDemuxer: StreamDemuxer {
             output?.demuxerDidProduceVideo(data, codec: codec, pts: pts, dts: dts)
         } else if let audioDecoder {
             for block in audioDecoder.decode(data, pts: pts) {
+                let stamp = pcmTimestamp(container: block.pts, frames: block.frames)
                 output?.demuxerDidProduceAudio(
-                    AccessUnit(data: block.data, pts: block.pts, dts: block.pts, isKeyframe: true))
+                    AccessUnit(data: block.data, pts: stamp, dts: stamp, isKeyframe: true))
             }
         } else {
             output?.demuxerDidProduceAudio(
@@ -266,10 +273,47 @@ final class FFStreamDemuxer: StreamDemuxer {
         }
     }
 
+    /// Places a block of decoded PCM on a continuous timeline of its own.
+    ///
+    /// Container timestamps are quantised: Matroska stores milliseconds, while
+    /// a 1024 sample frame at 48 kHz lasts 21.3 of them. Compressed packets
+    /// survive that, because the renderer decodes them into one stream. PCM
+    /// does not: every buffer is laid down at exactly the time it is given, so
+    /// rounded timestamps leave a fraction of a millisecond of gap or overlap
+    /// at each buffer edge, heard as a click at the frame rate.
+    ///
+    /// So the sample count sets the pace, anchored to the first block. The
+    /// projection is recomputed from the running total rather than added up,
+    /// which keeps integer division from drifting over a long stream.
+    private func pcmTimestamp(container pts: UInt64, frames: Int) -> UInt64 {
+        let rate = UInt64(max(pcmSampleRate, 1))
+        guard let anchor = pcmAnchor else {
+            pcmAnchor = pts
+            pcmSamples = UInt64(max(frames, 0))
+            return pts
+        }
+        let projected = anchor + pcmSamples * 90_000 / rate
+        // A container that has genuinely moved, after a seek or a gap in the
+        // stream, has to win. Only rounding is absorbed.
+        if abs(Int64(bitPattern: projected) - Int64(bitPattern: pts)) > Self.pcmResyncTicks {
+            pcmAnchor = pts
+            pcmSamples = UInt64(max(frames, 0))
+            return pts
+        }
+        pcmSamples += UInt64(max(frames, 0))
+        return projected
+    }
+
+    /// Quarter of a second. Comfortably past any rounding, well short of a seek.
+    private static let pcmResyncTicks: Int64 = 90_000 / 4
+
     private var videoCodecForPackets: VideoCodec?
     /// Set only for codecs Core Audio cannot take, in which case audio packets
     /// are decoded here and the player receives PCM.
     private var audioDecoder: TStreamFFAudioDecoder?
+    private var pcmAnchor: UInt64?
+    private var pcmSamples: UInt64 = 0
+    private var pcmSampleRate = 48_000
 
     private func report(_ error: TStreamError) {
         output?.demuxerDidFail(error)
