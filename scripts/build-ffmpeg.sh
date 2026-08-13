@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 #
-# Builds a minimal, LGPL-only FFmpeg (libavcodec/libavutil/libswscale) for Apple
-# platforms and packages it as xcframeworks. Video decode only — TStreamKit does
-# its own demuxing and audio, so we enable just the broadcast video decoders we
-# need (H.264, HEVC, MPEG-2) plus swscale for pixel-format conversion. No GPL
-# components, no network, no muxers/encoders.
+# Builds a minimal, LGPL-only FFmpeg for Apple platforms and packages it as
+# xcframeworks. Decode only: no GPL components, no network, no muxers/encoders.
+#
+# TStreamKit demuxes MPEG-TS itself, so libavformat is here purely for the
+# containers a transcoding server can serve instead (Matroska/WebM and MP4).
+# Audio goes to the system decoder wherever Core Audio can handle it, so
+# libavcodec only carries the codecs it cannot.
 #
 # Usage:
 #   scripts/build-ffmpeg.sh macos          # one platform (smoke test)
@@ -17,27 +19,43 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 WORK="$ROOT/.ffmpeg-build"
 SRC="$WORK/ffmpeg-$FFMPEG_VERSION"
 OUT="$WORK/install"
-LIBS=(libavcodec libavutil libswscale libavfilter)
+LIBS=(libavcodec libavutil libswscale libavfilter libavformat libswresample)
 
 # --- minimal LGPL feature set ------------------------------------------------
+# Every disable comes first, then the enables. configure applies these in order,
+# so a blanket --disable-demuxers listed after --enable-demuxer would silently
+# undo it.
 CONFIGURE_COMMON=(
   --disable-gpl --enable-version3            # LGPL v3, no GPL components
   # Hermetic build: never auto-detect/link host libraries. Without this the
-  # native macOS build picks up Homebrew's libX11 (/opt/homebrew/.../libX11.6
-  # .dylib) and links it into every lib, which then fails to load in a signed
-  # app (different Team ID) and crashes at launch. We use none of those external
+  # macOS build picks up Homebrew's libX11 (/opt/homebrew/.../libX11.6.dylib)
+  # and links it into every lib, which then fails to load in a signed app
+  # (different Team ID) and crashes at launch. We use none of those external
   # libs (software decode + bwdif/yadif only).
   --disable-autodetect
   --disable-everything
-  --enable-avcodec --enable-avutil --enable-swscale --enable-avfilter
-  --enable-decoder=h264,hevc,mpeg2video,mpeg4
-  --enable-parser=h264,hevc,mpegvideo,mpeg4video   # mpegvideo = MPEG-1/2 (no "mpeg2video" parser exists)
-  --enable-filter=bwdif,yadif,buffer,buffersink   # deinterlacing
-  --disable-avformat --disable-avdevice
-  --disable-swresample --disable-postproc
+  --disable-avdevice --disable-postproc
   --disable-programs --disable-doc --disable-htmlpages --disable-manpages
+  # No protocols: libavformat reads through an AVIOContext we supply, which is
+  # backed by the same URLSession download the TS path uses.
   --disable-network --disable-protocols
   --disable-encoders --disable-muxers --disable-demuxers --disable-bsfs
+
+  --enable-avcodec --enable-avutil --enable-swscale --enable-avfilter
+  --enable-avformat --enable-swresample
+
+  # Containers. MPEG-TS is handled by our own demuxer, which is tuned for DVB
+  # broadcast, so libavformat only covers what we cannot already read.
+  # matroska also reads WebM; mov also reads MP4 and its fragmented form.
+  --enable-demuxer=matroska,mov
+
+  # Decoders. vp8 and vorbis are the webtv-* profile codecs; the rest is
+  # broadcast video. AAC, AC-3, E-AC-3 and MP2 are absent on purpose: those go
+  # to the system decoder.
+  --enable-decoder=h264,hevc,mpeg2video,mpeg4,vp8,vorbis
+  --enable-parser=h264,hevc,mpegvideo,mpeg4video   # mpegvideo = MPEG-1/2 (no "mpeg2video" parser exists)
+  --enable-filter=bwdif,yadif,buffer,buffersink   # deinterlacing
+
   # Dynamic frameworks (LGPLv3 §4: the user can relink against a modified
   # FFmpeg). install-name-dir=@rpath lets us repackage the dylibs as embedded
   # .frameworks. See README "LGPL compliance".

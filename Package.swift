@@ -21,20 +21,23 @@ let package = Package(
         ),
 
         // Minimal LGPL FFmpeg, shipped as dynamic frameworks (built from source
-        // by scripts/build-ffmpeg.sh — decode-only: H.264/HEVC/MPEG-2 + swscale,
-        // no GPL/network/muxers). Dynamic linking keeps LGPL v3 §4 relinking
-        // intact; see THIRD_PARTY_LICENSES.md. Used by CFFVideoDecoder to
-        // robustly decode the non-IDR interlaced broadcast streams VideoToolbox
-        // can't handle.
+        // by scripts/build-ffmpeg.sh: decode only, no GPL/network/muxers).
+        // Dynamic linking keeps LGPL v3 §4 relinking intact; see
+        // THIRD_PARTY_LICENSES.md. libavcodec robustly decodes the non-IDR
+        // interlaced broadcast streams VideoToolbox can't handle; libavformat
+        // reads the Matroska/WebM and MP4 containers a server can transcode to.
         .binaryTarget(name: "libavcodec", path: "Frameworks/libavcodec.xcframework"),
         .binaryTarget(name: "libavutil", path: "Frameworks/libavutil.xcframework"),
         .binaryTarget(name: "libswscale", path: "Frameworks/libswscale.xcframework"),
         .binaryTarget(name: "libavfilter", path: "Frameworks/libavfilter.xcframework"),
+        .binaryTarget(name: "libavformat", path: "Frameworks/libavformat.xcframework"),
+        .binaryTarget(name: "libswresample", path: "Frameworks/libswresample.xcframework"),
 
-        // C shim exposing a tiny decode API over libavcodec.
+        // C shim exposing tiny decode and demux APIs over FFmpeg.
         .target(
             name: "CFFVideoDecoder",
-            dependencies: ["libavcodec", "libavutil", "libswscale", "libavfilter"],
+            dependencies: ["libavcodec", "libavutil", "libswscale", "libavfilter",
+                           "libavformat", "libswresample"],
             path: "Sources/CFFVideoDecoder",
             cSettings: [.headerSearchPath("ffmpeg")],
             linkerSettings: [
