@@ -162,6 +162,10 @@ build_framework() {
   # the binary and the symbols are ignored. strip afterwards keeps the shipped
   # binary the same size as before; the DWARF now lives in the dSYM.
   dsymutil "$bin" -o "$OUT/fw-$name/$lib.framework.dSYM"
+  # dsymutil also writes a relocation map per architecture, which exists for the
+  # bitcode re-symbolication flow that nothing here uses. Symbolication reads
+  # only the DWARF, so this is 10 MB across the set that no one ever opens.
+  rm -rf "$OUT/fw-$name/$lib.framework.dSYM/Contents/Resources/Relocations"
   # -S drops the debug info, -x the local symbols, which is what FFmpeg's own
   # install-time strip did before --disable-stripping turned it off. Exported
   # symbols and the UUID survive both.
