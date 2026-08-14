@@ -4,7 +4,7 @@ All notable changes to TStreamKit are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.2.0] - 2026-08-14
 
 ### Fixed
 - Anamorphic WebM played squeezed towards square, while the same channel over
@@ -71,6 +71,7 @@ Initial release.
 - SwiftUI `TStreamPlayerView` (plus UIKit/AppKit hosting) with pause/resume,
   progress reporting, and approximate seeking for recordings.
 
+[1.2.0]: https://github.com/arvedviehweger/TStreamKit/releases/tag/v1.2.0
 [1.1.0]: https://github.com/arvedviehweger/TStreamKit/releases/tag/v1.1.0
 [1.0.1]: https://github.com/arvedviehweger/TStreamKit/releases/tag/v1.0.1
 [1.0.0]: https://github.com/arvedviehweger/TStreamKit/releases/tag/v1.0.0
