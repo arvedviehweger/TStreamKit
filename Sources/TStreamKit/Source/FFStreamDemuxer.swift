@@ -180,11 +180,15 @@ final class FFStreamDemuxer: StreamDemuxer {
     private func announce(_ info: CFFStreamInfo) {
         if info.has_video != 0, let codec = Self.videoCodec(info.video_codec) {
             let extradata = Self.data(info.video_extradata, info.video_extradata_size)
+            let aspect = PixelAspect(numerator: info.video_sar_num,
+                                     denominator: info.video_sar_den)
             videoCodecForPackets = codec
-            output?.demuxerDidParseVideoFormat(codec, extradata: extradata)
+            output?.demuxerDidParseVideoFormat(codec, extradata: extradata, pixelAspect: aspect)
+            let shape = aspect.map { $0.isSquare ? "square pixels" : "pixel aspect \($0.numerator):\($0.denominator)" }
+                ?? "no pixel aspect"
             TStreamDiagnostics.log(
                 "ffdemux: video \(codec) \(info.video_width)x\(info.video_height), "
-                + "\(extradata?.count ?? 0) bytes of extradata")
+                + "\(extradata?.count ?? 0) bytes of extradata, \(shape)")
         }
 
         guard info.has_audio != 0 else { return }

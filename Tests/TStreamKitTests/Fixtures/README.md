@@ -17,6 +17,14 @@ ffmpeg -f lavfi -i testsrc=size=128x96:rate=25:duration=1 \
        -f lavfi -i "sine=frequency=440:duration=1" \
        -c:v libvpx -b:v 100k -ac 2 -c:a vorbis -strict -2 -b:a 32k probe.webm
 
+# WebM, anamorphic VP8: coded 120x90, displayed 160x90, so the pixels are 4:3.
+# VP8 cannot signal an aspect ratio, so this only exists in the container and is
+# what the pixel-aspect test guards. The numbers are chosen to stay integers:
+# Matroska stores the display size as whole pixels, so a height of 96 at 16:9
+# would round and the ratio would come out as 171:128 instead.
+ffmpeg -f lavfi -i testsrc=size=120x90:rate=25:duration=1 \
+       -c:v libvpx -b:v 100k -aspect 16:9 -an probe-anamorphic.webm
+
 # Fragmented MP4, H.264 + AAC
 ffmpeg -f lavfi -i testsrc=size=128x96:rate=25:duration=1 \
        -f lavfi -i "sine=frequency=440:duration=1" \

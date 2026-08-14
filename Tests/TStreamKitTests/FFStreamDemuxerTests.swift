@@ -98,6 +98,50 @@ final class FFStreamDemuxerTests: XCTestCase {
         XCTAssertLessThanOrEqual(bytes, 44100 * 4 * 2)
     }
 
+    /// VP8 has no field for an aspect ratio, so for anamorphic WebM the
+    /// container's display size is the only record of the picture's shape. Drop
+    /// it and a 16:9 stream renders at its coded 4:3, visibly squeezed towards
+    /// square. The fixture is coded 120x90 for display at 160x90, so the pixels
+    /// are 4:3.
+    func testWebMCarriesTheContainersPixelAspect() throws {
+        let spy = play(try fixture("probe-anamorphic", "webm"), contentType: "video/webm")
+
+        XCTAssertEqual(spy.errors, [])
+        let format = try XCTUnwrap(spy.videoFormats.first)
+        XCTAssertEqual(format.codec, .vp8)
+        XCTAssertEqual(format.pixelAspect, PixelAspect(numerator: 4, denominator: 3))
+
+        // Reporting it is not enough, it has to reach the pixels. The decoder
+        // puts it on the pixel buffer, which is what makes the display layer
+        // stretch the picture back to 16:9.
+        let decoder = try XCTUnwrap(TStreamFFVideoDecoder(codec: format.codec,
+                                                          packetized: true,
+                                                          extradata: format.extradata,
+                                                          pixelAspect: format.pixelAspect))
+        var frames: [TStreamFFVideoDecoder.DecodedFrame] = []
+        for (index, packet) in spy.videoData.enumerated() {
+            frames += decoder.decode(packet, pts: Int64(index) * 3600, dts: Int64(index) * 3600)
+        }
+        let first = try XCTUnwrap(frames.first).pixelBuffer
+        XCTAssertEqual(CVPixelBufferGetWidth(first), 120)
+        XCTAssertEqual(CVPixelBufferGetHeight(first), 90)
+
+        let attachment = CVBufferCopyAttachment(first, kCVImageBufferPixelAspectRatioKey, nil)
+        let aspect = try XCTUnwrap(attachment as? [CFString: Any],
+                                   "the frame carries no pixel aspect, so it renders squeezed to 4:3")
+        XCTAssertEqual(aspect[kCVImageBufferPixelAspectRatioHorizontalSpacingKey] as? Int, 4)
+        XCTAssertEqual(aspect[kCVImageBufferPixelAspectRatioVerticalSpacingKey] as? Int, 3)
+    }
+
+    /// The counterpart: square-pixel content must not be stretched. The container
+    /// says 1:1 and that has to stay 1:1 all the way to the decoder.
+    func testSquarePixelWebMStaysSquare() throws {
+        let spy = play(try fixture("probe", "webm"), contentType: "video/webm")
+
+        let aspect = try XCTUnwrap(spy.videoFormats.first?.pixelAspect)
+        XCTAssertTrue(aspect.isSquare, "expected square pixels, got \(aspect)")
+    }
+
     /// The packets have to survive the whole way into pixels. This is the part
     /// that breaks without extradata: in Matroska the NAL units are length
     /// prefixed and the parameter sets live in the avcC record, so a decoder

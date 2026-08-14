@@ -34,14 +34,15 @@ final class StubURLProtocol: URLProtocol {
 final class MediaSourceSpy: MediaSourceDelegate {
     var video: [(codec: VideoCodec, pts: UInt64)] = []
     var videoData: [Data] = []
-    var videoFormats: [(codec: VideoCodec, extradata: Data?)] = []
+    var videoFormats: [(codec: VideoCodec, extradata: Data?, pixelAspect: PixelAspect?)] = []
     var audioFormats: [AudioFormat] = []
     var audio: [AccessUnit] = []
     var errors: [TStreamError] = []
     let received = XCTestExpectation(description: "source produced output")
 
-    func mediaSource(_ s: MediaSource, didParseVideoFormat codec: VideoCodec, extradata: Data?) {
-        videoFormats.append((codec, extradata))
+    func mediaSource(_ s: MediaSource, didParseVideoFormat codec: VideoCodec, extradata: Data?,
+                     pixelAspect: PixelAspect?) {
+        videoFormats.append((codec, extradata, pixelAspect))
     }
 
     func mediaSource(_ s: MediaSource, didProduceVideo data: Data, codec: VideoCodec, pts: UInt64, dts: UInt64) {

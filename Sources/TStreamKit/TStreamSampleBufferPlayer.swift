@@ -45,6 +45,9 @@ final class TStreamSampleBufferPlayer: NSObject {
     /// Codec setup record from that container. Can legitimately be nil even when
     /// packetized: VP8 in WebM carries no setup record.
     private var videoExtradata: Data?
+    /// Pixel shape the container advertised, for codecs that cannot signal one.
+    /// Nil for MPEG-TS, which always has it in the bitstream.
+    private var videoPixelAspect: PixelAspect?
 
     // Audio: compressed AAC/AC-3 → system audio renderer. Confined to
     // `audioRenderQueue`.
@@ -343,11 +346,13 @@ final class TStreamSampleBufferPlayer: NSObject {
 // MARK: - Demuxer consumption
 
 extension TStreamSampleBufferPlayer: MediaSourceDelegate {
-    func mediaSource(_ s: MediaSource, didParseVideoFormat codec: VideoCodec, extradata: Data?) {
+    func mediaSource(_ s: MediaSource, didParseVideoFormat codec: VideoCodec, extradata: Data?,
+                     pixelAspect: PixelAspect?) {
         renderQueue.async { [weak self] in
             guard let self, !self.stopped else { return }
             self.videoIsPacketized = true
             self.videoExtradata = extradata
+            self.videoPixelAspect = pixelAspect
             // A format can only arrive before the first packet, but rebuild
             // anyway so a mid-stream format change can't decode with stale setup.
             self.ffDecoder = nil
@@ -383,7 +388,8 @@ extension TStreamSampleBufferPlayer: MediaSourceDelegate {
         if ffDecoder == nil {
             ffDecoder = TStreamFFVideoDecoder(codec: codec,
                                               packetized: videoIsPacketized,
-                                              extradata: videoExtradata)
+                                              extradata: videoExtradata,
+                                              pixelAspect: videoPixelAspect)
             if ffDecoder == nil {
                 DispatchQueue.main.async { [weak self] in self?.onError?(.unsupportedCodec("video decoder init failed")) }
                 return

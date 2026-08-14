@@ -27,7 +27,11 @@ final class TStreamFFVideoDecoder {
     /// record at all but is still packetized, and treating "no extradata" as
     /// "needs a parser" would look for a VP8 parser that this build has no
     /// reason to include.
-    init?(codec: VideoCodec, packetized: Bool = false, extradata: Data? = nil) {
+    /// `pixelAspect` is what the container said about the shape of a pixel. It is
+    /// only consulted for frames that carry no aspect of their own, so it changes
+    /// nothing for H.264, HEVC or MPEG-2 and everything for anamorphic VP8.
+    init?(codec: VideoCodec, packetized: Bool = false, extradata: Data? = nil,
+          pixelAspect: PixelAspect? = nil) {
         let id: CFFCodec
         switch codec {
         case .h264: id = CFF_CODEC_H264
@@ -40,7 +44,8 @@ final class TStreamFFVideoDecoder {
         if packetized {
             let setup = extradata ?? Data()
             created = setup.withUnsafeBytes { raw in
-                cff_create_packetized(id, raw.bindMemory(to: UInt8.self).baseAddress, Int32(raw.count))
+                cff_create_packetized(id, raw.bindMemory(to: UInt8.self).baseAddress, Int32(raw.count),
+                                      pixelAspect?.numerator ?? 0, pixelAspect?.denominator ?? 0)
             }
         } else {
             created = cff_create(id)

@@ -47,6 +47,10 @@ struct CFFVideoDecoder {
     int64_t stat_filter_us;
     int64_t stat_frames;
     int stat_w, stat_h, stat_interlaced;
+
+    // Aspect ratio the container advertised, 0/0 if none. Only consulted when a
+    // decoded frame carries no aspect of its own. See ensure_graph().
+    AVRational container_sar;
 };
 
 static enum AVCodecID codec_id_for(CFFCodec codec) {
@@ -63,7 +67,8 @@ static enum AVCodecID codec_id_for(CFFCodec codec) {
 // already framed and must skip it. `extradata` is copied into the context
 // before opening, which is how length-prefixed H.264 becomes decodable.
 static CFFVideoDecoder *create(CFFCodec codec, int use_parser,
-                               const uint8_t *extradata, int extradata_size) {
+                               const uint8_t *extradata, int extradata_size,
+                               int sar_num, int sar_den) {
     enum AVCodecID id = codec_id_for(codec);
     const AVCodec *avcodec = avcodec_find_decoder(id);
     if (!avcodec) return NULL;
@@ -87,6 +92,10 @@ static CFFVideoDecoder *create(CFFCodec codec, int use_parser,
         dec->ctx->extradata_size = extradata_size;
     }
 
+    if (sar_num > 0 && sar_den > 0) {
+        dec->container_sar = (AVRational){ sar_num, sar_den };
+    }
+
     dec->ctx->err_recognition = 0;
     dec->ctx->error_concealment = FF_EC_GUESS_MVS | FF_EC_DEBLOCK;
     dec->ctx->flags |= AV_CODEC_FLAG_OUTPUT_CORRUPT;
@@ -101,11 +110,13 @@ static CFFVideoDecoder *create(CFFCodec codec, int use_parser,
 }
 
 CFFVideoDecoder *cff_create(CFFCodec codec) {
-    return create(codec, 1, NULL, 0);
+    // Annex-B input is MPEG-TS, where the aspect always rides in the bitstream.
+    return create(codec, 1, NULL, 0, 0, 0);
 }
 
-CFFVideoDecoder *cff_create_packetized(CFFCodec codec, const uint8_t *extradata, int extradata_size) {
-    return create(codec, 0, extradata, extradata_size);
+CFFVideoDecoder *cff_create_packetized(CFFCodec codec, const uint8_t *extradata, int extradata_size,
+                                       int sar_num, int sar_den) {
+    return create(codec, 0, extradata, extradata_size, sar_num, sar_den);
 }
 
 void cff_destroy(CFFVideoDecoder *dec) {
@@ -174,7 +185,14 @@ static int ensure_graph(CFFVideoDecoder *dec, AVFrame *frame) {
     dec->graph = avfilter_graph_alloc();
     if (!dec->graph) return -1;
 
+    // The bitstream wins where it says anything, which is the precedence
+    // av_guess_sample_aspect_ratio() uses. Only when it is silent does the
+    // container's aspect apply, and that is the VP8-in-WebM case: VP8 cannot
+    // signal an aspect at all, so without this an anamorphic 720x576 stream
+    // would render 5:4 instead of 16:9. Whatever is decided here becomes the
+    // graph's pixel_aspect and so the aspect of every frame it outputs.
     AVRational sar = frame->sample_aspect_ratio;
+    if (sar.num <= 0 || sar.den <= 0) sar = dec->container_sar;
     if (sar.num <= 0 || sar.den <= 0) { sar.num = 1; sar.den = 1; }
 
     char args[512];

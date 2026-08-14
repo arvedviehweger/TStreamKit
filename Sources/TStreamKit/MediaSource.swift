@@ -40,7 +40,8 @@ protocol MediaSourceDelegate: AnyObject {
     /// is the codec setup record, which the decoder needs for length-prefixed
     /// H.264 in Matroska and MP4. MPEG-TS carries its parameter sets in the
     /// stream and never calls this.
-    func mediaSource(_ source: MediaSource, didParseVideoFormat codec: VideoCodec, extradata: Data?)
+    func mediaSource(_ source: MediaSource, didParseVideoFormat codec: VideoCodec, extradata: Data?,
+                     pixelAspect: PixelAspect?)
     /// One chunk of the video stream. Annex-B bytes to be parsed when no format
     /// was announced, otherwise exactly one already-framed packet.
     func mediaSource(_ source: MediaSource, didProduceVideo data: Data,

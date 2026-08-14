@@ -39,6 +39,14 @@ typedef struct {
     int video_height;
     const uint8_t *video_extradata;      // avcC / hvcC / CodecPrivate
     int video_extradata_size;
+    // Sample (pixel) aspect ratio the container advertises, 0/0 if it says
+    // nothing. Matroska keeps it in DisplayWidth/DisplayHeight and MP4 in the
+    // pasp atom. It matters for codecs that cannot carry aspect information in
+    // the bitstream: VP8 has no field for it at all, so for anamorphic WebM
+    // this is the only place the display shape exists. H.264, HEVC and MPEG-2
+    // signal it in the bitstream, which stays authoritative.
+    int video_sar_num;
+    int video_sar_den;
 
     int has_audio;
     CFFAudioCodec audio_codec;

@@ -6,6 +6,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+- Anamorphic WebM played squeezed towards square, while the same channel over
+  MPEG-TS filled the frame correctly. VP8 cannot signal an aspect ratio at all,
+  so for WebM the container's display size is the only record of the picture's
+  shape, and it was never read. The container's pixel aspect now reaches the
+  decoder and is only consulted when the bitstream is silent, so H.264, HEVC and
+  MPEG-2 keep signalling their own, as does MPEG-TS.
+
 ### Added
 - x86_64 support, so the package builds and runs on Intel Macs. The FFmpeg
   frameworks now carry arm64 and x86_64 slices for macOS and for the iOS and

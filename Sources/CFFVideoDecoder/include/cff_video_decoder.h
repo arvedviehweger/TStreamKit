@@ -49,7 +49,13 @@ CFFVideoDecoder *cff_create(CFFCodec codec);
 // units carry a length prefix instead of a start code, and the parameter sets
 // live in the extradata rather than in the stream, so the decoder can only make
 // sense of it once the extradata is set. Pass NULL/0 to leave it unset.
-CFFVideoDecoder *cff_create_packetized(CFFCodec codec, const uint8_t *extradata, int extradata_size);
+//
+// `sar_num`/`sar_den` are the container's sample aspect ratio, 0/0 if it gives
+// none. It is used only for frames that carry no aspect themselves, which is
+// what VP8 needs: the codec cannot signal one, so WebM's DisplayWidth is the
+// only description of the picture's shape.
+CFFVideoDecoder *cff_create_packetized(CFFCodec codec, const uint8_t *extradata, int extradata_size,
+                                       int sar_num, int sar_den);
 
 void cff_destroy(CFFVideoDecoder *dec);
 

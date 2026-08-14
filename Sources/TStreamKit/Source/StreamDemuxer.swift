@@ -22,13 +22,32 @@ extension StreamDemuxer {
     func stop() {}
 }
 
+/// Shape of a single pixel, as a container describes it. Only carried for codecs
+/// that cannot signal it themselves: VP8 has no field for an aspect ratio, so for
+/// anamorphic WebM the container is the only place the picture's real shape is
+/// written down. H.264, HEVC and MPEG-2 put it in the bitstream and are
+/// unaffected, as is MPEG-TS.
+struct PixelAspect: Equatable, Sendable {
+    let numerator: Int32
+    let denominator: Int32
+
+    init?(numerator: Int32, denominator: Int32) {
+        guard numerator > 0, denominator > 0 else { return nil }
+        self.numerator = numerator
+        self.denominator = denominator
+    }
+
+    /// A square pixel needs no correction, so it is worth nothing to pass on.
+    var isSquare: Bool { numerator == denominator }
+}
+
 /// What a `StreamDemuxer` emits. Timestamps are 90 kHz for every container.
 protocol StreamDemuxerOutput: AnyObject {
     /// Reported before any video packet when the container describes its video
     /// out of band. `extradata` is the codec setup record (avcC, hvcC, VP8
     /// CodecPrivate). MPEG-TS carries this in the stream itself and never calls
     /// this, which is what keeps its decode path unchanged.
-    func demuxerDidParseVideoFormat(_ codec: VideoCodec, extradata: Data?)
+    func demuxerDidParseVideoFormat(_ codec: VideoCodec, extradata: Data?, pixelAspect: PixelAspect?)
     func demuxerDidProduceVideo(_ data: Data, codec: VideoCodec, pts: UInt64, dts: UInt64)
     func demuxerDidParseAudioFormat(_ format: AudioFormat)
     func demuxerDidProduceAudio(_ unit: AccessUnit)

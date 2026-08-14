@@ -143,7 +143,8 @@ int cff_demux_stream_info(CFFDemuxer *d, CFFStreamInfo *out) {
     memset(out, 0, sizeof(*out));
 
     if (d->video_index >= 0) {
-        AVCodecParameters *p = d->fmt->streams[d->video_index]->codecpar;
+        AVStream *st = d->fmt->streams[d->video_index];
+        AVCodecParameters *p = st->codecpar;
         int supported = 0;
         CFFCodec codec = map_video_codec(p->codec_id, &supported);
         if (supported) {
@@ -153,6 +154,15 @@ int cff_demux_stream_info(CFFDemuxer *d, CFFStreamInfo *out) {
             out->video_height = p->height;
             out->video_extradata = p->extradata;
             out->video_extradata_size = p->extradata_size;
+            // The demuxer puts the container's aspect on the stream; codecpar
+            // only carries one if the codec itself signalled it. Prefer the
+            // stream and leave 0/0 when neither says anything.
+            AVRational sar = st->sample_aspect_ratio;
+            if (sar.num <= 0 || sar.den <= 0) sar = p->sample_aspect_ratio;
+            if (sar.num > 0 && sar.den > 0) {
+                out->video_sar_num = sar.num;
+                out->video_sar_den = sar.den;
+            }
         } else {
             // Nothing we can decode: stop following it so packets aren't
             // handed out for a stream the player would only throw away.
