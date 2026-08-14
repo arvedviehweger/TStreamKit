@@ -60,7 +60,7 @@ CFFDemuxer *cff_demux_create(CFFReadCallback read, void *opaque) {
     if (!buffer) { cff_demux_destroy(d); return NULL; }
 
     // write_flag 0, no seek callback: the stream is forward-only, which is what
-    // a live transcode from tvheadend gives us anyway.
+    // a live transcode gives us anyway.
     d->avio = avio_alloc_context(buffer, CFF_AVIO_BUFFER_SIZE, 0, d, cff_avio_read, NULL, NULL);
     if (!d->avio) { av_free(buffer); cff_demux_destroy(d); return NULL; }
     d->avio->seekable = 0;

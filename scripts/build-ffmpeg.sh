@@ -49,11 +49,11 @@ CONFIGURE_COMMON=(
   # matroska also reads WebM; mov also reads MP4 and its fragmented form.
   --enable-demuxer=matroska,mov
 
-  # Decoders. vp8 and vorbis are the webtv-* profile codecs; the rest is
+  # Decoders. vp8, vorbis and opus are the webtv-* profile codecs; the rest is
   # broadcast video. AC-3, E-AC-3 and MP2 are absent on purpose: those go to
   # the system decoder. AAC is here as a fallback only, for the profiles Core
   # Audio refuses, such as AAC Main.
-  --enable-decoder=h264,hevc,mpeg2video,mpeg4,vp8,vorbis,aac
+  --enable-decoder=h264,hevc,mpeg2video,mpeg4,vp8,vorbis,opus,aac
   --enable-parser=h264,hevc,mpegvideo,mpeg4video   # mpegvideo = MPEG-1/2 (no "mpeg2video" parser exists)
   --enable-filter=bwdif,yadif,buffer,buffersink   # deinterlacing
 

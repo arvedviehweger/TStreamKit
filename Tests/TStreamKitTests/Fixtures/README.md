@@ -41,3 +41,12 @@ check that libavcodec really decodes AAC and not just that a decoder opens:
 ffmpeg -f lavfi -i "sine=frequency=440:duration=0.5:sample_rate=48000" \
        -ac 1 -c:a aac -b:a 32k -f adts probe.adts
 ```
+
+`probe-opus.webm` is the same one second clip with Opus audio, so the decoded
+PCM path is covered for both codecs that use it:
+
+```sh
+ffmpeg -f lavfi -i testsrc=size=128x96:rate=25:duration=1 \
+       -f lavfi -i "sine=frequency=440:duration=1" \
+       -c:v libvpx -b:v 100k -ac 2 -c:a libopus -b:a 32k probe-opus.webm
+```

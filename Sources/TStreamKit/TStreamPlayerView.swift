@@ -16,7 +16,7 @@ import AppKit
 /// ```swift
 /// struct PlayerScreen: View {
 ///     var body: some View {
-///         TStreamPlayerView(url: URL(string: "http://tvheadend:9981/stream/channel/1")!)
+///         TStreamPlayerView(url: URL(string: "http://server:9981/stream/channel/1")!)
 ///     }
 /// }
 /// ```

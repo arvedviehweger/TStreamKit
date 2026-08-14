@@ -351,7 +351,7 @@ being written, so a live stream has to be fragmented.
 | | AC-3 (Dolby Digital) | ATSC 0x81 · DVB 0x06 + desc 0x6A |
 | | E-AC-3 (Dolby Digital Plus) | ATSC 0x87 · DVB 0x06 + desc 0x7A |
 | | MPEG-1/2 Layer II (MP2) → transcoded to AAC | PMT 0x03 / 0x04 |
-| | Vorbis → decoded to PCM | Matroska/WebM |
+| | Vorbis, Opus → decoded to PCM | Matroska/WebM |
 
 - Both **ATSC** (US) and **DVB** (Europe) PMT signaling are recognized, including
   the DVB AC-3/E-AC-3 descriptors that don't use the ATSC stream types.
@@ -370,7 +370,7 @@ Seeking is supported for **recordings** (approximate, GOP-accurate — see
 to seek within.
 
 **Not supported:** AC-4 (no decoder exists on Apple platforms or in FFmpeg),
-Opus, VP9, AV1, DRM/encrypted streams, and subtitles/teletext. Frame-accurate
+VP9, AV1, DRM/encrypted streams, and subtitles/teletext. Frame-accurate
 scrubbing is out of scope — this targets live and simple recording playback, not
 a full VOD/DVR engine.
 
