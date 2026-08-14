@@ -97,6 +97,10 @@ The package vendors prebuilt **dynamic** FFmpeg `xcframework`s under
 `Frameworks/`, so it works directly in Xcode with no extra build step. Xcode
 embeds and signs them automatically when you add the package to an app target.
 
+Each `xcframework` ships its `dSYM`s. Xcode copies them into your app's archive,
+so App Store Connect stops warning about missing debug symbols and crashes
+inside FFmpeg symbolicate down to function and line.
+
 ## Usage
 
 The whole public API is one SwiftUI view, `TStreamPlayerView`, plus a small

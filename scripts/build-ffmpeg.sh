@@ -64,8 +64,17 @@ CONFIGURE_COMMON=(
   # Dynamic frameworks (LGPLv3 §4: the user can relink against a modified
   # FFmpeg). install-name-dir=@rpath lets us repackage the dylibs as embedded
   # .frameworks. See README "LGPL compliance".
-  --enable-pic --enable-shared --disable-static --disable-debug
+  --enable-pic --enable-shared --disable-static
   --install-name-dir=@rpath
+
+  # Keep -g (configure's default) and stop `make install` from stripping, so the
+  # linked dylib still carries the debug map pointing at its .o files. That is
+  # what dsymutil needs to build a .dSYM. build_framework extracts it and then
+  # strips the binary itself, so what ships is unchanged. Without this an app
+  # embedding these frameworks gets "no dSYM" warnings from App Store Connect
+  # and unsymbolicated FFmpeg frames in crash reports. -g costs build time and
+  # disk in .ffmpeg-build only; it does not affect optimization.
+  --disable-stripping
 )
 
 download() {
@@ -147,6 +156,17 @@ build_framework() {
     fi
   done
 
+  # dSYM last: dsymutil reads the debug map in $bin, which points at the .o
+  # files still sitting in $WORK/build, and records $bin's UUID. Both install
+  # name rewrites have to be done by now, or the UUID in the dSYM stops matching
+  # the binary and the symbols are ignored. strip afterwards keeps the shipped
+  # binary the same size as before; the DWARF now lives in the dSYM.
+  dsymutil "$bin" -o "$OUT/fw-$name/$lib.framework.dSYM"
+  # -S drops the debug info, -x the local symbols, which is what FFmpeg's own
+  # install-time strip did before --disable-stripping turned it off. Exported
+  # symbols and the UUID survive both.
+  strip -S -x "$bin"
+
   cat > "$plistdir/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -174,12 +194,20 @@ make_xcframework() {
   build_framework tvossim  "$lib" 15.0 0 arm64 x86_64
   rm -rf "$ROOT/Frameworks/$lib.xcframework"
   mkdir -p "$ROOT/Frameworks"
+  # -debug-symbols applies to the -framework it follows, and needs absolute
+  # paths. This is what puts the dSYMs inside the xcframework so an app
+  # embedding it can ship them in its archive.
   xcodebuild -create-xcframework \
     -framework "$OUT/fw-macos/$lib.framework" \
+    -debug-symbols "$OUT/fw-macos/$lib.framework.dSYM" \
     -framework "$OUT/fw-ios/$lib.framework" \
+    -debug-symbols "$OUT/fw-ios/$lib.framework.dSYM" \
     -framework "$OUT/fw-iossim/$lib.framework" \
+    -debug-symbols "$OUT/fw-iossim/$lib.framework.dSYM" \
     -framework "$OUT/fw-tvos/$lib.framework" \
+    -debug-symbols "$OUT/fw-tvos/$lib.framework.dSYM" \
     -framework "$OUT/fw-tvossim/$lib.framework" \
+    -debug-symbols "$OUT/fw-tvossim/$lib.framework.dSYM" \
     -output "$ROOT/Frameworks/$lib.xcframework"
 }
 

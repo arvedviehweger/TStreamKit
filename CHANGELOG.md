@@ -11,6 +11,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   frameworks now carry arm64 and x86_64 slices for macOS and for the iOS and
   tvOS simulators. Devices stay arm64 only. The x86 slices are built with full
   SIMD, so software decode keeps its speed.
+- `dSYM`s for the FFmpeg frameworks, shipped inside the `xcframework`s. An app
+  embedding TStreamKit no longer gets "no debug symbol file" warnings from App
+  Store Connect, and FFmpeg frames in crash reports resolve to function and
+  line. The shipped binaries are unchanged in size, the debug info lives in the
+  `dSYM`s.
 
 ## [1.1.0] - 2026-08-14
 
