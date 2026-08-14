@@ -12,6 +12,10 @@
 #   scripts/build-ffmpeg.sh macos          # one platform (smoke test)
 #   scripts/build-ffmpeg.sh all            # every Apple platform + xcframeworks
 #
+# macOS and both simulators are built arm64 + x86_64 and lipo'd into universal
+# frameworks, so the package works on Intel Macs. That needs nasm on PATH for
+# the x86 SIMD (brew install nasm); without it configure falls back to plain C
+# and software decode on Intel gets several times slower.
 set -euo pipefail
 
 FFMPEG_VERSION="${FFMPEG_VERSION:-7.1}"
@@ -99,27 +103,37 @@ build_one() {
   )
 }
 
-# Wraps a built dylib in a .framework, fixing its install name and the
+# Wraps the built dylibs in a .framework, fixing its install name and the
 # references to its sibling FFmpeg dylibs so they resolve as embedded frameworks
 # (@rpath/<lib>.framework/<lib>). macOS frameworks are versioned, iOS/tvOS flat.
-# <variant> <lib> <platform-id> <min-os> <is-macos:0|1>
+# More than one arch is merged into a universal binary with lipo.
+# <variant> <lib> <min-os> <is-macos:0|1> <arch>...
 build_framework() {
-  local name="$1" lib="$2" platform="$3" minos="$4" macos="$5"
-  local libdir="$OUT/$name-arm64/lib"
-  local src; src="$(ls "$libdir/$lib".*.dylib 2>/dev/null | head -1 || true)"
-  [ -n "$src" ] || src="$libdir/$lib.dylib"
+  local name="$1" lib="$2" minos="$3" macos="$4"; shift 4
+  local srcs=() arch
+  for arch in "$@"; do
+    local libdir="$OUT/$name-$arch/lib"
+    local src; src="$(ls "$libdir/$lib".*.dylib 2>/dev/null | head -1 || true)"
+    [ -n "$src" ] || src="$libdir/$lib.dylib"
+    srcs+=("$src")
+  done
 
   local fw="$OUT/fw-$name/$lib.framework"
   rm -rf "$fw"; mkdir -p "$fw"
   local bin plistdir
   if [ "$macos" = "1" ]; then
     mkdir -p "$fw/Versions/A/Resources"
-    cp "$src" "$fw/Versions/A/$lib"
     ( cd "$fw"; ln -s A Versions/Current; ln -s Versions/Current/"$lib" "$lib"; ln -s Versions/Current/Resources Resources )
     bin="$fw/Versions/A/$lib"; plistdir="$fw/Versions/A/Resources"
   else
-    cp "$src" "$fw/$lib"
     bin="$fw/$lib"; plistdir="$fw"
+  fi
+  # cp for a lone arch: `lipo -create` with one input would wrap it in a fat
+  # header, which the device slices have no reason to carry.
+  if [ "${#srcs[@]}" -gt 1 ]; then
+    lipo -create "${srcs[@]}" -output "$bin"
+  else
+    cp "${srcs[0]}" "$bin"
   fi
 
   chmod u+w "$bin"
@@ -153,11 +167,11 @@ PLIST
 # Assemble one xcframework for <lib> across all platform variants.
 make_xcframework() {
   local lib="$1"
-  build_framework macos    "$lib" macos          12.0 1
-  build_framework ios      "$lib" iphoneos        15.0 0
-  build_framework iossim   "$lib" iphonesimulator 15.0 0
-  build_framework tvos     "$lib" appletvos       15.0 0
-  build_framework tvossim  "$lib" appletvsimulator 15.0 0
+  build_framework macos    "$lib" 12.0 1 arm64 x86_64
+  build_framework ios      "$lib" 15.0 0 arm64
+  build_framework iossim   "$lib" 15.0 0 arm64 x86_64
+  build_framework tvos     "$lib" 15.0 0 arm64
+  build_framework tvossim  "$lib" 15.0 0 arm64 x86_64
   rm -rf "$ROOT/Frameworks/$lib.xcframework"
   mkdir -p "$ROOT/Frameworks"
   xcodebuild -create-xcframework \
@@ -172,19 +186,23 @@ make_xcframework() {
 case "${1:-macos}" in
   macos)
     download
-    build_one macos arm64 macosx "-mmacosx-version-min=12.0"
-    echo "==> macOS smoke build done: $OUT/macos-arm64/lib"
-    ls -la "$OUT/macos-arm64/lib"/*.a
+    build_one macos arm64  macosx "-mmacosx-version-min=12.0"
+    build_one macos x86_64 macosx "-mmacosx-version-min=12.0"
+    echo "==> macOS smoke build done: $OUT/macos-{arm64,x86_64}/lib"
     ;;
   all)
     download
-    # arm64 only (Apple Silicon Macs + their simulators + devices). x86_64
-    # simulator slices would need nasm and only matter on Intel Macs.
+    # iOS/tvOS devices are arm64 only; macOS and the simulators also get x86_64
+    # so the package builds and runs on Intel Macs. The slices are lipo'd
+    # together in build_framework.
     build_one macos       arm64  macosx            "-mmacosx-version-min=12.0"
+    build_one macos       x86_64 macosx            "-mmacosx-version-min=12.0"
     build_one ios         arm64  iphoneos          "-miphoneos-version-min=15.0"
     build_one iossim      arm64  iphonesimulator   "-mios-simulator-version-min=15.0"
+    build_one iossim      x86_64 iphonesimulator   "-mios-simulator-version-min=15.0"
     build_one tvos        arm64  appletvos         "-mtvos-version-min=15.0"
     build_one tvossim     arm64  appletvsimulator  "-mtvos-simulator-version-min=15.0"
+    build_one tvossim     x86_64 appletvsimulator  "-mtvos-simulator-version-min=15.0"
     for lib in "${LIBS[@]}"; do
       make_xcframework "$lib"
     done

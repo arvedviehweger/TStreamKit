@@ -4,6 +4,14 @@ All notable changes to TStreamKit are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- x86_64 support, so the package builds and runs on Intel Macs. The FFmpeg
+  frameworks now carry arm64 and x86_64 slices for macOS and for the iOS and
+  tvOS simulators. Devices stay arm64 only. The x86 slices are built with full
+  SIMD, so software decode keeps its speed.
+
 ## [1.1.0] - 2026-08-14
 
 ### Added

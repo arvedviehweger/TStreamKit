@@ -82,7 +82,8 @@ and outputs zero-copy I420 frames straight into the display layer.
 
 - iOS 15+ / tvOS 15+ / macOS 12+
 - Swift 6 toolchain (builds in language mode 5)
-- Apple platforms only (the FFmpeg frameworks are arm64)
+- Apple platforms only. The FFmpeg frameworks cover arm64 devices, and arm64 +
+  x86_64 on macOS and the simulators, so Intel Macs are supported.
 
 ## Installation
 
@@ -386,7 +387,8 @@ distribution clean:
   [`scripts/build-ffmpeg.sh`](scripts/build-ffmpeg.sh).
 - **Built from source.** FFmpeg 7.1 is downloaded and compiled by that script —
   no opaque prebuilt binaries. Re-run it with `scripts/build-ffmpeg.sh all` to
-  reproduce every `Frameworks/*.xcframework`.
+  reproduce every `Frameworks/*.xcframework`. The x86_64 slices need `nasm`
+  (`brew install nasm`) for the SIMD kernels.
 - **Dynamic linking (LGPL v3 §4).** The FFmpeg libraries are shipped as
   **dynamic** frameworks, so an end user can replace them with a modified FFmpeg
   and relink — satisfying the LGPL's relinking requirement without you having to
