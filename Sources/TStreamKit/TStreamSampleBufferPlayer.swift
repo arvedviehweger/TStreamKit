@@ -102,6 +102,9 @@ final class TStreamSampleBufferPlayer: NSObject {
     private var videoRequesting = false
     private var audioRequesting = false
     private var stopped = false
+    /// Whether a failure has already been passed on. Main queue only, like the
+    /// `onError` callback it guards.
+    private var reportedError = false
 
     // Backpressure: a recording downloads as fast as the link allows, so without
     // throttling every frame is decoded into an (uncompressed) CVPixelBuffer and
@@ -124,9 +127,7 @@ final class TStreamSampleBufferPlayer: NSObject {
         synchronizer.addRenderer(displayLayer)
 
         source.delegate = self
-        source.onError = { [weak self] error in
-            DispatchQueue.main.async { self?.onError?(error) }
-        }
+        source.onError = { [weak self] error in self?.report(error) }
     }
 
     deinit {
@@ -368,6 +369,22 @@ final class TStreamSampleBufferPlayer: NSObject {
         updateBackpressure()
     }
 
+    /// Reports the first failure and nothing after it.
+    ///
+    /// A source announces a failure twice — once through its `onError` closure
+    /// and once through the delegate — and both land here. A caller that reacts
+    /// to a failure by rebuilding the player (retrying a stream on a different
+    /// URL, say) must not be told again that the attempt it has already
+    /// abandoned failed: the second report would arrive after the decision and
+    /// undo it.
+    private func report(_ error: TStreamError) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self, !self.reportedError else { return }
+            self.reportedError = true
+            self.onError?(error)
+        }
+    }
+
     private func configureAudioSession() {
         #if os(iOS) || os(tvOS)
         let session = AVAudioSession.sharedInstance()
@@ -427,7 +444,7 @@ extension TStreamSampleBufferPlayer: MediaSourceDelegate {
     }
 
     func mediaSource(_ s: MediaSource, didFail error: TStreamError) {
-        DispatchQueue.main.async { [weak self] in self?.onError?(error) }
+        report(error)
     }
 
     // MARK: ingest (video on renderQueue, audio on audioRenderQueue)
@@ -440,7 +457,7 @@ extension TStreamSampleBufferPlayer: MediaSourceDelegate {
                                               extradata: videoExtradata,
                                               pixelAspect: videoPixelAspect)
             if ffDecoder == nil {
-                DispatchQueue.main.async { [weak self] in self?.onError?(.unsupportedCodec("video decoder init failed")) }
+                report(.unsupportedCodec("video decoder init failed"))
                 return
             }
         }
