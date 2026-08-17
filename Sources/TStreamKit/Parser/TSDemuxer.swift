@@ -1,3 +1,4 @@
+import CFFVideoDecoder
 import Foundation
 
 enum VideoCodec: Sendable { case h264, h265, mpeg2, vp8 }
@@ -143,6 +144,9 @@ final class TSDemuxer {
         pendingField = nil
         videoPES = PESAccumulator()
         audioPES = PESAccumulator()
+        // The route the audio takes belongs to the stream and survives a seek;
+        // the timeline it is laid on does not, and the next block re-anchors it.
+        pcmTimeline.reset()
     }
 
     func consume(_ packet: TSPacket) {
@@ -539,6 +543,20 @@ final class TSDemuxer {
 
     private let latmParser = LATMParser()
 
+    /// How this stream's AAC reaches the player. Decided once, from what the
+    /// system decoder says about the profile it is actually in.
+    private enum AACRoute {
+        /// Passed through compressed, for the renderer to decode.
+        case system
+        /// Decoded here, because Core Audio turns this profile down.
+        case decoded(TStreamFFAudioDecoder)
+        /// Neither decoder will take it. Dropped rather than handed to a
+        /// renderer that was never given a format to read it with.
+        case dropped
+    }
+    private var aacRoute = AACRoute.system
+    private var pcmTimeline = PCMTimeline()
+
     private func completeAudioPES(_ bytes: [UInt8]) {
         guard let header = parsePESHeader(bytes) else { return }
         let elementary = Array(bytes[header.payloadOffset...])
@@ -560,22 +578,14 @@ final class TSDemuxer {
         guard let cfg = latmParser.config else { return }
 
         if !didEmitAudioFormat {
-            didEmitAudioFormat = true
-            delegate?.demuxer(self, didParseAudioFormat: AudioFormat(codec: .aac,
-                                                                    sampleRate: cfg.sampleRate,
-                                                                    channels: cfg.channels,
-                                                                    samplesPerFrame: 1024,
-                                                                    decoderConfig: cfg.audioSpecificConfig))
+            emitAACFormat(sampleRate: cfg.sampleRate, channels: cfg.channels,
+                          config: cfg.audioSpecificConfig)
         }
 
         // Each AAC frame is 1024 samples; spread PTS across the frames in the PES.
         let ticksPerFrame = UInt64(1024 * 90000 / max(cfg.sampleRate, 1))
         for (index, frame) in frames.enumerated() {
-            let pts = header.pts + UInt64(index) * ticksPerFrame
-            delegate?.demuxer(self, didProduceAudio: AccessUnit(data: Data(frame),
-                                                               pts: pts,
-                                                               dts: pts,
-                                                               isKeyframe: true))
+            emitAAC(Data(frame), pts: header.pts + UInt64(index) * ticksPerFrame)
         }
     }
 
@@ -585,23 +595,78 @@ final class TSDemuxer {
 
         if !didEmitAudioFormat {
             let cfg = ADTS.config(from: frames[0])
-            didEmitAudioFormat = true
-            delegate?.demuxer(self, didParseAudioFormat: AudioFormat(codec: .aac,
-                                                                    sampleRate: cfg.sampleRate,
-                                                                    channels: cfg.channels,
-                                                                    samplesPerFrame: 1024,
-                                                                    decoderConfig: cfg.audioSpecificConfig))
+            emitAACFormat(sampleRate: cfg.sampleRate, channels: cfg.channels,
+                          config: cfg.audioSpecificConfig)
         }
 
         // Each AAC frame is 1024 samples; distribute PTS across frames in the PES.
         let sampleRate = ADTS.sampleRates[safe: frames[0].sampleRateIndex] ?? 44100
         let ticksPerFrame = UInt64(1024 * 90000 / max(sampleRate, 1))
         for (index, frame) in frames.enumerated() {
-            let pts = header.pts + UInt64(index) * ticksPerFrame
-            delegate?.demuxer(self, didProduceAudio: AccessUnit(data: Data(frame.raw),
-                                                               pts: pts,
-                                                               dts: pts,
-                                                               isKeyframe: true))
+            emitAAC(Data(frame.raw), pts: header.pts + UInt64(index) * ticksPerFrame)
+        }
+    }
+
+    /// Announces the stream's AAC, once, and decides how its frames will be
+    /// played.
+    ///
+    /// Core Audio does not decode every AAC profile: it refuses AAC Main
+    /// outright, whatever we describe it as, and a transcoding server that
+    /// labels its output Main is enough to hit that. The refusal never reaches
+    /// us — it surfaces inside the renderer as silence over playing video — so
+    /// the decoder has to be asked before we commit to passing frames through.
+    private func emitAACFormat(sampleRate: Int, channels: Int, config: Data) {
+        didEmitAudioFormat = true
+        let format = AudioFormat(codec: .aac, sampleRate: sampleRate, channels: channels,
+                                 samplesPerFrame: 1024, decoderConfig: config)
+        let described = AudioSpecificConfig(parsing: config)
+            .map { "object type \($0.objectType), \($0.sampleRate) Hz, \($0.channels) ch" }
+            ?? "not understood"
+        let hex = config.map { String(format: "%02x", $0) }.joined()
+        TStreamDiagnostics.log("ts: audio aac \(sampleRate) Hz, \(channels) ch, "
+                               + "config \(hex.isEmpty ? "none" : hex) (\(described))")
+
+        if CoreAudioSupport.canDecode(format) {
+            aacRoute = .system
+            delegate?.demuxer(self, didParseAudioFormat: format)
+            return
+        }
+
+        TStreamDiagnostics.log("ts: the system decoder will not take this AAC, decoding it here")
+        guard let decoder = TStreamFFAudioDecoder(codec: CFF_AUDIO_AAC,
+                                                  sampleRate: sampleRate,
+                                                  channels: max(channels, 1),
+                                                  extradata: config) else {
+            aacRoute = .dropped
+            TStreamDiagnostics.log("ts: could not open the AAC decoder, playing video only")
+            return
+        }
+        aacRoute = .decoded(decoder)
+        pcmTimeline.sampleRate = decoder.sampleRate
+        pcmTimeline.reset()
+        delegate?.demuxer(self, didParseAudioFormat: AudioFormat(codec: .pcm,
+                                                                sampleRate: decoder.sampleRate,
+                                                                channels: decoder.channels,
+                                                                samplesPerFrame: 1,
+                                                                decoderConfig: Data()))
+        TStreamDiagnostics.log(
+            "ts: audio decoded to PCM, \(decoder.sampleRate) Hz, \(decoder.channels) ch")
+    }
+
+    /// Hands on one raw AAC frame, by whichever route the format decided.
+    private func emitAAC(_ frame: Data, pts: UInt64) {
+        switch aacRoute {
+        case .system:
+            delegate?.demuxer(self, didProduceAudio: AccessUnit(data: frame, pts: pts, dts: pts,
+                                                                isKeyframe: true))
+        case .decoded(let decoder):
+            for block in decoder.decode(frame, pts: pts) {
+                let stamp = pcmTimeline.stamp(container: block.pts, frames: block.frames)
+                delegate?.demuxer(self, didProduceAudio: AccessUnit(data: block.data, pts: stamp,
+                                                                   dts: stamp, isKeyframe: true))
+            }
+        case .dropped:
+            break
         }
     }
 

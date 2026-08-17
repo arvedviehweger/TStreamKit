@@ -100,6 +100,30 @@ enum TS {
         return b
     }
 
+    /// A PMT for a radio programme: one audio ES and no video entry at all,
+    /// with the PCR carried on the audio PID as a real radio mux does.
+    static func radioPMT(audioPID: UInt16, streamType: UInt8 = 0x0F) -> [UInt8] {
+        let loop: [UInt8] = [
+            streamType,
+            UInt8(0xE0 | UInt8((audioPID >> 8) & 0x1F)), UInt8(audioPID & 0xFF),
+            0xF0, 0x00,       // ES_info_length = 0
+        ]
+        let sectionLength = 9 + loop.count + 4
+        var b: [UInt8] = [
+            0x00,             // pointer_field
+            0x02,             // table_id (PMT)
+            UInt8(0xB0 | UInt8((sectionLength >> 8) & 0x0F)), UInt8(sectionLength & 0xFF),
+            0x00, 0x01,       // program_number
+            0xC1,             // version / current_next
+            0x00, 0x00,       // section / last section
+            UInt8(0xE0 | UInt8((audioPID >> 8) & 0x1F)), UInt8(audioPID & 0xFF), // PCR_PID
+            0xF0, 0x00,       // program_info_length = 0
+        ]
+        b += loop
+        b += [0x00, 0x00, 0x00, 0x00] // CRC (not validated)
+        return b
+    }
+
     /// One E-AC-3 syncframe of `sizeBytes` bytes (header + zero padding).
     /// Defaults: independent substream, 48 kHz, 6 blocks (1536 samples), stereo.
     static func eac3Frame(sizeBytes: Int = 128, strmtyp: Int = 0,
@@ -172,6 +196,23 @@ enum TS {
             out += [0x00, 0x00, 0x00, 0x01]
             out += nal
         }
+        return out
+    }
+
+    /// Splits one PES packet over as many TS packets as it takes, numbering
+    /// them the way the demuxer's continuity check expects. The last packet is
+    /// padded with `0xFF`, as `packet(pid:...)` pads any short payload.
+    static func packets(pid: UInt16, pes: [UInt8], continuityCounter: inout UInt8) -> [UInt8] {
+        var out: [UInt8] = []
+        var offset = 0
+        repeat {
+            let end = min(offset + 184, pes.count)
+            out += packet(pid: pid, payloadUnitStart: offset == 0,
+                          continuityCounter: continuityCounter,
+                          payload: Array(pes[offset..<end]))
+            continuityCounter = (continuityCounter + 1) & 0x0F
+            offset = end
+        } while offset < pes.count
         return out
     }
 

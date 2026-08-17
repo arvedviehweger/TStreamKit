@@ -4,6 +4,14 @@ All notable changes to TStreamKit are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- AAC the system decoder refuses is now decoded here on the **MPEG-TS** path as
+  well, not only in the containers libavformat reads. A transcoding server that
+  labels its output AAC Main — tvheadend's `webtv-h264-aac-mpegts` profile does
+  — played its video in silence.
+
 ## [1.2.0] - 2026-08-14
 
 ### Fixed

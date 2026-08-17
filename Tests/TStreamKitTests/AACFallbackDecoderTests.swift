@@ -43,6 +43,53 @@ final class AACFallbackDecoderTests: XCTestCase {
         XCTAssertGreaterThan(bytes, expected / 2, "far less audio came out than went in")
     }
 
+    /// The refusal has to be caught on the MPEG-TS path too, not only in the
+    /// containers libavformat reads: a tvheadend `webtv-h264-aac-mpegts`
+    /// profile serves the same AAC the matroska one does, and it played its
+    /// video in silence.
+    func testTransportStreamAACTheSystemRefusesArrivesAsPCM() throws {
+        let url = try XCTUnwrap(Bundle.module.url(forResource: "Fixtures/probe", withExtension: "adts"),
+                                "fixture probe.adts is missing")
+        let payloads = Self.rawFrames(in: try Data(contentsOf: url))
+        XCTAssertGreaterThan(payloads.count, 5, "fixture carries too little audio to be a test")
+
+        let spy = DemuxerSpy()
+        let demuxer = TSDemuxer()
+        demuxer.delegate = spy
+        let parser = TSPacketParser()
+        let audioPID: UInt16 = 0x0101
+
+        var stream = TS.packet(pid: 0x0000, payloadUnitStart: true, payload: TS.pat(pmtPID: 0x1000))
+        stream += TS.packet(pid: 0x1000, payloadUnitStart: true,
+                            payload: TS.radioPMT(audioPID: audioPID, streamType: 0x0F))
+        var counter: UInt8 = 0
+        for (index, payload) in payloads.enumerated() {
+            // 48 kHz mono, labelled AAC Main: what the transcoding server sends.
+            let frame = TS.adts(payload: [UInt8](payload), sampleRateIndex: 3, channels: 1, profile: 0)
+            let pes = TS.pes(streamID: 0xC0, pts: 9000 + UInt64(index) * 1920, payload: frame)
+            stream += TS.packets(pid: audioPID, pes: pes, continuityCounter: &counter)
+        }
+
+        for packet in parser.push(Data(stream)) { demuxer.consume(packet) }
+        demuxer.flush()
+
+        // Compressed frames would reach a renderer that cannot decode them, and
+        // the stream would play silently. Decoded PCM is the whole point.
+        XCTAssertEqual(spy.audioFormat?.codec, .pcm)
+        XCTAssertEqual(spy.audioFormat?.sampleRate, 48000)
+        XCTAssertEqual(spy.audioFormat?.channels, 1)
+        XCTAssertFalse(spy.audioUnits.isEmpty, "no audio came out of the fallback decoder")
+        // Interleaved 16 bit mono, so two bytes a sample. Allow for the decoder
+        // holding back a frame; anything near the input length proves the path.
+        let bytes = spy.audioUnits.reduce(0) { $0 + $1.data.count }
+        XCTAssertGreaterThan(bytes, payloads.count * 1024 * 2 / 2, "far less audio came out than went in")
+
+        // PCM is laid down where it is stamped, so the stamps have to advance.
+        let stamps = spy.audioUnits.map(\.pts)
+        XCTAssertEqual(stamps, stamps.sorted())
+        XCTAssertGreaterThan(stamps.last ?? 0, stamps.first ?? 0)
+    }
+
     /// Splits an ADTS file into the raw frames a container would hand us.
     private static func rawFrames(in data: Data) -> [Data] {
         var frames: [Data] = []
