@@ -46,6 +46,10 @@ protocol MediaSourceDelegate: AnyObject {
     /// was announced, otherwise exactly one already-framed packet.
     func mediaSource(_ source: MediaSource, didProduceVideo data: Data,
                      codec: VideoCodec, pts: UInt64, dts: UInt64)
+    /// The stream has no video: only audio will ever be produced. Sent once,
+    /// before any packet, so the player can anchor its clock on the audio
+    /// instead of waiting for a first frame.
+    func mediaSourceDidDetectAudioOnly(_ source: MediaSource)
     func mediaSource(_ source: MediaSource, didParseAudioFormat format: AudioFormat)
     func mediaSource(_ source: MediaSource, didProduceAudio unit: AccessUnit)
     func mediaSource(_ source: MediaSource, didFail error: TStreamError)

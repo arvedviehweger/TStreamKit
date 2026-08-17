@@ -24,7 +24,53 @@ final class DemuxerSpy: TSDemuxerDelegate {
     }
 }
 
+/// Collects what `TSStreamDemuxer` hands the source.
+private final class StreamOutputSpy: StreamDemuxerOutput {
+    var audioOnlyReports = 0
+    var audioFormats: [AudioFormat] = []
+
+    func demuxerDidParseVideoFormat(_ codec: VideoCodec, extradata: Data?, pixelAspect: PixelAspect?) {}
+    func demuxerDidProduceVideo(_ data: Data, codec: VideoCodec, pts: UInt64, dts: UInt64) {}
+    func demuxerDidDetectAudioOnly() { audioOnlyReports += 1 }
+    func demuxerDidParseAudioFormat(_ format: AudioFormat) { audioFormats.append(format) }
+    func demuxerDidProduceAudio(_ unit: AccessUnit) {}
+    func demuxerDidFail(_ error: TStreamError) {}
+}
+
 final class TSDemuxerTests: XCTestCase {
+    /// A radio programme has no video PID, so nothing would ever open the
+    /// player's audio gate. The demuxer has to say so, once, off the PMT.
+    func testRadioProgrammeIsReportedAsAudioOnly() {
+        let spy = StreamOutputSpy()
+        let demuxer = TSStreamDemuxer()
+        demuxer.output = spy
+
+        var stream = TS.packet(pid: 0x0000, payloadUnitStart: true, payload: TS.pat(pmtPID: 0x1000))
+        stream += TS.packet(pid: 0x1000, payloadUnitStart: true,
+                            payload: TS.radioPMT(audioPID: 0x0101, streamType: 0x03))
+        // The PMT repeats throughout the mux; the report must not.
+        stream += TS.packet(pid: 0x1000, payloadUnitStart: true, continuityCounter: 1,
+                            payload: TS.radioPMT(audioPID: 0x0101, streamType: 0x03))
+        demuxer.consume(Data(stream))
+
+        XCTAssertEqual(spy.audioOnlyReports, 1)
+    }
+
+    /// The counterpart: a programme with a picture must never be reported as
+    /// audio-only, or audio would start playing before the first keyframe.
+    func testProgrammeWithVideoIsNotReportedAsAudioOnly() {
+        let spy = StreamOutputSpy()
+        let demuxer = TSStreamDemuxer()
+        demuxer.output = spy
+
+        var stream = TS.packet(pid: 0x0000, payloadUnitStart: true, payload: TS.pat(pmtPID: 0x1000))
+        stream += TS.packet(pid: 0x1000, payloadUnitStart: true,
+                            payload: TS.pmt(videoPID: 0x0100, audio: [(0x03, 0x0101, [])]))
+        demuxer.consume(Data(stream))
+
+        XCTAssertEqual(spy.audioOnlyReports, 0)
+    }
+
     func testNALSplittingAndAVCC() {
         let sps: [UInt8] = [0x67, 0x42, 0x00, 0x1F, 0x96]
         let pps: [UInt8] = [0x68, 0xCE, 0x3C, 0x80]

@@ -41,6 +41,7 @@ public struct TStreamPlayerView: View {
     private var handle: TStreamPlayerHandle?
     private var onError: ((TStreamError) -> Void)?
     private var onReady: (() -> Void)?
+    private var onAudioOnly: (() -> Void)?
     private var onProgress: ((TimeInterval) -> Void)?
 
     public init(url: URL, headers: [String: String] = [:], autoPlay: Bool = true) {
@@ -86,10 +87,19 @@ public struct TStreamPlayerView: View {
         return copy
     }
 
+    /// Called on the main thread when the stream turns out to carry no video, so
+    /// the host can show something other than an empty display layer. Fires
+    /// before playback starts, and only for a stream that really has no video.
+    public func onAudioOnly(_ handler: @escaping () -> Void) -> TStreamPlayerView {
+        var copy = self
+        copy.onAudioOnly = handler
+        return copy
+    }
+
     public var body: some View {
         _TStreamPlayerContainer(url: url, headers: headers, autoPlay: autoPlay,
                                 isPaused: isPaused, handle: handle, onError: onError,
-                                onReady: onReady, onProgress: onProgress)
+                                onReady: onReady, onAudioOnly: onAudioOnly, onProgress: onProgress)
     }
 }
 
@@ -103,6 +113,7 @@ private struct _TStreamPlayerContainer: View {
     let handle: TStreamPlayerHandle?
     let onError: ((TStreamError) -> Void)?
     let onReady: (() -> Void)?
+    let onAudioOnly: (() -> Void)?
     let onProgress: ((TimeInterval) -> Void)?
 
     @StateObject private var model = PlayerModel()
@@ -116,7 +127,8 @@ private struct _TStreamPlayerContainer: View {
         }
         .onAppear {
             model.configure(url: url, headers: headers, autoPlay: autoPlay,
-                            onError: onError, onReady: onReady, onProgress: onProgress)
+                            onError: onError, onReady: onReady, onAudioOnly: onAudioOnly,
+                            onProgress: onProgress)
             handle?.player = model.player
             model.setPaused(isPaused)
         }
@@ -134,11 +146,13 @@ private final class PlayerModel: ObservableObject {
 
     func configure(url: URL, headers: [String: String], autoPlay: Bool,
                    onError: ((TStreamError) -> Void)?, onReady: (() -> Void)?,
+                   onAudioOnly: (() -> Void)?,
                    onProgress: ((TimeInterval) -> Void)?) {
         guard player == nil else { return }
         let player = TStreamSampleBufferPlayer(url: url, headers: headers)
         player.onError = onError
         player.onReadyToPlay = onReady
+        player.onAudioOnly = onAudioOnly
         player.onProgress = onProgress
         self.player = player
         if autoPlay { player.play() }

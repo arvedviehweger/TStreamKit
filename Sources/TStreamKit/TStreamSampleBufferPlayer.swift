@@ -15,6 +15,10 @@ final class TStreamSampleBufferPlayer: NSObject {
 
     var onError: ((TStreamError) -> Void)?
     var onReadyToPlay: (() -> Void)?
+    /// The stream carries no video — a radio channel. Called on the main thread
+    /// as soon as the source says so, which is before playback starts, so a host
+    /// can put something on screen instead of leaving the display layer black.
+    var onAudioOnly: (() -> Void)?
     /// Reports elapsed playback seconds (relative to the first frame) ~4×/sec
     /// once the clock is running. Delivered on the main thread.
     var onProgress: ((TimeInterval) -> Void)?
@@ -63,24 +67,34 @@ final class TStreamSampleBufferPlayer: NSObject {
     /// is the audio-queue-local stand-in for `sawVideo` + `discardingUntilSeek`,
     /// which live on `renderQueue`. Toggled via `openAudioGate` / `closeAudioGate`.
     private var audioGateOpen = false
+    /// Audio-queue mirror of `audioOnly`: with no video to time the stream
+    /// against, every audio packet also has to drive the playback clock and the
+    /// backpressure check, which live on `renderQueue`.
+    private var audioDrivesClock = false
 
     private var clockStarted = false
     /// User-initiated pause (distinct from the backpressure source pause). While
     /// set, the synchronizer rate is held at 0 so video *and* audio freeze.
     private var userPaused = false
     private var progressObserver: Any?
-    /// PTS of the very first frame of the whole stream — the anchor for absolute
-    /// position reporting. Unlike `firstVideoPTS` it is NOT reset on a seek, so
+    /// PTS of the very first sample of the whole stream — the anchor for absolute
+    /// position reporting. Unlike `firstPTS` it is NOT reset on a seek, so
     /// `onProgress` keeps reporting the true offset within the recording.
     private var streamStartPTS: CMTime?
     /// True between requesting a seek and the source confirming the new request
     /// has started. While set, decoded frames are discarded so stale pre-seek
     /// data can't anchor the clock at the wrong position.
     private var discardingUntilSeek = false
-    /// PTS anchor for the current segment (reset on every seek).
-    private var firstVideoPTS: CMTime?
-    private var latestVideoPTS: CMTime = .zero
+    /// PTS anchor for the current segment (reset on every seek). Video sets the
+    /// pace wherever there is any; on an audio-only stream the audio does.
+    private var firstPTS: CMTime?
+    private var latestPTS: CMTime = .zero
     private let prerollSeconds = 1.0
+    /// Set when the source reports the stream carries no video — a radio
+    /// channel. Nothing will ever arrive to open the audio gate or anchor the
+    /// clock, so the audio has to do both itself. On `renderQueue`; the
+    /// audio-queue mirror is `audioDrivesClock`.
+    private var audioOnly = false
 
     // Whether each renderer currently has an active media-data request. We arm
     // it only while there is data to drain and stop when empty — otherwise the
@@ -159,13 +173,13 @@ final class TStreamSampleBufferPlayer: NSObject {
     /// how the position is resolved is the source's business, and decoding
     /// resumes at the next keyframe. Absolute position (`onProgress`) stays
     /// correct because it is anchored to `streamStartPTS`, not the per-segment
-    /// `firstVideoPTS`. A live stream isn't seekable and this does nothing.
+    /// `firstPTS`. A live stream isn't seekable and this does nothing.
     func seek(toFraction fraction: Double) {
         renderQueue.async {
             guard !self.stopped, self.source.isSeekable else { return }
             self.flushForSeek()
             self.source.seek(toFraction: fraction) { [weak self] in
-                self?.renderQueue.async { self?.discardingUntilSeek = false }
+                self?.renderQueue.async { self?.endSeekDiscard() }
             }
         }
     }
@@ -187,8 +201,8 @@ final class TStreamSampleBufferPlayer: NSObject {
         closeAudioGate(flush: true)
         ffDecoder = nil          // fresh decoder waits for the next keyframe
         clockStarted = false
-        firstVideoPTS = nil
-        latestVideoPTS = .zero
+        firstPTS = nil
+        latestPTS = .zero
         sawVideo = false
         sourcePaused = false
         discardingUntilSeek = true
@@ -289,9 +303,9 @@ final class TStreamSampleBufferPlayer: NSObject {
     /// Seconds of video decoded ahead of the playback position. Before the clock
     /// starts we measure against the first PTS (we're still prerolling).
     private func bufferedAheadSeconds() -> Double {
-        guard let firstVideoPTS else { return 0 }
-        let clock = clockStarted ? synchronizer.currentTime() : firstVideoPTS
-        return CMTimeGetSeconds(latestVideoPTS - clock)
+        guard let firstPTS else { return 0 }
+        let clock = clockStarted ? synchronizer.currentTime() : firstPTS
+        return CMTimeGetSeconds(latestPTS - clock)
     }
 
     private func updateBackpressure() {
@@ -316,13 +330,21 @@ final class TStreamSampleBufferPlayer: NSObject {
         }
     }
 
+    /// Ingest stops discarding stale data here rather than at the call sites: an
+    /// audio-only stream has no keyframe coming to reopen the audio gate, so
+    /// this is also where it reopens. On `renderQueue`.
+    private func endSeekDiscard() {
+        discardingUntilSeek = false
+        if audioOnly { openAudioGate() }
+    }
+
     private func startClockIfReady() {
-        guard !stopped, !clockStarted, let firstVideoPTS else { return }
-        guard CMTimeGetSeconds(latestVideoPTS - firstVideoPTS) >= prerollSeconds else { return }
+        guard !stopped, !clockStarted, let firstPTS else { return }
+        guard CMTimeGetSeconds(latestPTS - firstPTS) >= prerollSeconds else { return }
         clockStarted = true
         // Honour a pause requested during buffering: bring the clock up frozen
         // (the first frame is presented) instead of auto-playing.
-        synchronizer.setRate(userPaused ? 0 : 1.0, time: firstVideoPTS)
+        synchronizer.setRate(userPaused ? 0 : 1.0, time: firstPTS)
         progressObserver = synchronizer.addPeriodicTimeObserver(
             forInterval: CMTime(seconds: 0.25, preferredTimescale: 600), queue: .main
         ) { [weak self] time in
@@ -331,7 +353,19 @@ final class TStreamSampleBufferPlayer: NSObject {
             self.onProgress?(max(0, CMTimeGetSeconds(time - base)))
         }
         DispatchQueue.main.async { [weak self] in self?.onReadyToPlay?() }
-        TStreamDiagnostics.log("sbplayer: clock started at \(CMTimeGetSeconds(firstVideoPTS))s")
+        TStreamDiagnostics.log("sbplayer: clock started at \(CMTimeGetSeconds(firstPTS))s")
+    }
+
+    /// An audio-only stream has no frames to anchor the clock on or to measure
+    /// the buffer against, so its audio timeline stands in for the video one.
+    /// On `renderQueue`, hopped to from the audio ingest.
+    private func noteAudioTimeline(_ pts: CMTime) {
+        guard !stopped, !discardingUntilSeek else { return }
+        if streamStartPTS == nil { streamStartPTS = pts }
+        if firstPTS == nil { firstPTS = pts }
+        latestPTS = pts
+        startClockIfReady()
+        updateBackpressure()
     }
 
     private func configureAudioSession() {
@@ -361,6 +395,21 @@ extension TStreamSampleBufferPlayer: MediaSourceDelegate {
 
     func mediaSource(_ s: MediaSource, didProduceVideo data: Data, codec: VideoCodec, pts: UInt64, dts: UInt64) {
         renderQueue.async { [weak self] in self?.ingestRawVideo(data, codec: codec, pts: pts, dts: dts) }
+    }
+
+    func mediaSourceDidDetectAudioOnly(_ s: MediaSource) {
+        DispatchQueue.main.async { [weak self] in self?.onAudioOnly?() }
+        renderQueue.async { [weak self] in
+            guard let self, !self.stopped else { return }
+            self.audioOnly = true
+            // Mid-seek the gate stays shut; `endSeekDiscard` opens it instead.
+            guard !self.discardingUntilSeek else { return }
+            self.openAudioGate()
+        }
+        audioRenderQueue.async { [weak self] in
+            guard let self, !self.audioStopped else { return }
+            self.audioDrivesClock = true
+        }
     }
 
     func mediaSource(_ s: MediaSource, didParseAudioFormat format: AudioFormat) {
@@ -410,8 +459,8 @@ extension TStreamSampleBufferPlayer: MediaSourceDelegate {
         guard let sample = Self.makeVideoSampleBuffer(
             pixelBuffer: frame.pixelBuffer, pts: pts, duration: .invalid) else { return }
         if streamStartPTS == nil { streamStartPTS = pts }
-        if firstVideoPTS == nil { firstVideoPTS = pts }
-        latestVideoPTS = pts
+        if firstPTS == nil { firstPTS = pts }
+        latestPTS = pts
         videoQueue.append(sample)
         armVideo()
         startClockIfReady()
@@ -431,6 +480,9 @@ extension TStreamSampleBufferPlayer: MediaSourceDelegate {
         guard let sample else { return }
         audioQueue.append(sample)
         armAudio()
+        if audioDrivesClock {
+            renderQueue.async { [weak self] in self?.noteAudioTimeline(pts) }
+        }
     }
 }
 

@@ -188,6 +188,18 @@ final class FFStreamDemuxer: StreamDemuxer {
             TStreamDiagnostics.log(
                 "ffdemux: video \(codec) \(info.video_width)x\(info.video_height), "
                 + "\(extradata?.count ?? 0) bytes of extradata, \(shape)")
+        } else {
+            // A radio channel has no video stream at all; a video stream in a
+            // codec we cannot map amounts to the same thing, since its packets
+            // would only be dropped. Either way the player has to be told, or
+            // it waits for a first frame that is never coming.
+            if info.has_video != 0 {
+                TStreamDiagnostics.log(
+                    "ffdemux: video codec \(info.video_codec.rawValue) not supported, playing audio only")
+            } else {
+                TStreamDiagnostics.log("ffdemux: no video stream, playing audio only")
+            }
+            output?.demuxerDidDetectAudioOnly()
         }
 
         guard info.has_audio != 0 else { return }
