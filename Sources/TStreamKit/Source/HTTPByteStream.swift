@@ -33,6 +33,9 @@ final class HTTPByteStream: NSObject {
     private var stopped = false
     private var paused = false
 
+    /// How long a request may deliver nothing before it is given up on. Long
+    /// enough for a tuner to lock and a transcoder to start.
+    private static let stallTimeout: TimeInterval = 20
     /// Byte offset of the current request (0 for the initial, non-ranged fetch).
     private var rangeOffset: Int64 = 0
 
@@ -65,7 +68,14 @@ final class HTTPByteStream: NSObject {
         self.httpHeaders = headers
         self.credential = credential
         self.queue = queue
-        self.configuration = configuration
+        // A live stream that goes quiet is dead, and the default minute of
+        // patience is a minute of spinner before anything can react. This is the
+        // gap between packets, not the length of the stream: continuous delivery
+        // never trips it, and `timeoutIntervalForResource` — which does cap the
+        // whole stream, and must stay at its default of days — is untouched.
+        let timed = (configuration.copy() as? URLSessionConfiguration) ?? configuration
+        timed.timeoutIntervalForRequest = Self.stallTimeout
+        self.configuration = timed
         super.init()
     }
 
