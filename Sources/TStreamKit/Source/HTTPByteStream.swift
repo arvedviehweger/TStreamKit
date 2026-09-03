@@ -36,6 +36,21 @@ final class HTTPByteStream: NSObject {
     /// How long a request may deliver nothing before it is given up on. Long
     /// enough for a tuner to lock and a transcoder to start.
     private static let stallTimeout: TimeInterval = 20
+    /// Requests issued for this stream, counting retries and seeks. Only for
+    /// the log, where an attempt that reports nothing is indistinguishable from
+    /// one that was never made.
+    private var attempt = 0
+    /// Whether the one automatic retry has been spent. Not reset by a seek: a
+    /// server that answers and sends nothing twice is not going to start.
+    private var retriedEmptyResponse = false
+    /// How long to wait before that retry. Long enough for a server to finish
+    /// releasing the previous subscription, short enough not to feel like a
+    /// hang.
+    private static let emptyResponseRetryDelay = 0.75
+    /// Body bytes delivered for the current request. Zero at the moment the
+    /// connection drops says the server accepted the request and then sent
+    /// nothing, which is a different problem from a stream that broke off.
+    private var receivedBytes = 0
     /// Byte offset of the current request (0 for the initial, non-ranged fetch).
     private var rangeOffset: Int64 = 0
 
@@ -82,8 +97,8 @@ final class HTTPByteStream: NSObject {
     func start() {
         queue.async {
             guard self.dataTask == nil, self.failure == nil, !self.stopped else { return }
-            self.startRequest(rangeOffset: 0)
             TStreamDiagnostics.log("source: started fetching \(self.httpURL.absoluteString)")
+            self.startRequest(rangeOffset: 0)
         }
     }
 
@@ -107,6 +122,7 @@ final class HTTPByteStream: NSObject {
     private func startRequest(rangeOffset: Int64) {
         guard self.failure == nil, !self.stopped else { return }
         self.rangeOffset = rangeOffset
+        self.receivedBytes = 0
         var request = URLRequest(url: httpURL)
         request.setValue("identity", forHTTPHeaderField: "Accept-Encoding")
         for (field, value) in httpHeaders {
@@ -115,6 +131,9 @@ final class HTTPByteStream: NSObject {
         if rangeOffset > 0 {
             request.setValue("bytes=\(rangeOffset)-", forHTTPHeaderField: "Range")
         }
+        attempt += 1
+        TStreamDiagnostics.log(
+            "source: request \(attempt)\(rangeOffset > 0 ? " from byte \(rangeOffset)" : "")")
         let task = session.dataTask(with: request)
         dataTask = task
         task.resume()
@@ -196,6 +215,10 @@ extension HTTPByteStream: URLSessionDataDelegate {
         queue.async {
             // Drop bytes from a task we've already replaced (e.g. after a seek).
             guard self.failure == nil, !self.stopped, dataTask == self.dataTask else { return }
+            if self.receivedBytes == 0 {
+                TStreamDiagnostics.log("source: first \(data.count) bytes arrived")
+            }
+            self.receivedBytes += data.count
             self.onData?(data)
         }
     }
@@ -213,10 +236,14 @@ extension HTTPByteStream: URLSessionDataDelegate {
         // request that's the remainder, so add the offset to get the total.
         let expected = response.expectedContentLength
         let mime = (response as? HTTPURLResponse)?.value(forHTTPHeaderField: "Content-Type")
+        let status = (response as? HTTPURLResponse)?.statusCode ?? 0
         queue.async { [weak self] in
             guard let self else { return }
             if expected > 0 { self.setLength(self.rangeOffset + expected) }
             if let mime { self.contentType = mime }
+            TStreamDiagnostics.log(
+                "source: HTTP \(status), content type \(mime ?? "none"), "
+                + "length \(expected > 0 ? String(expected) : "unknown")")
         }
         completionHandler(.allow)
     }
@@ -226,6 +253,36 @@ extension HTTPByteStream: URLSessionDataDelegate {
             // Ignore completion of a task we've already replaced (seek/cancel).
             guard !self.stopped, task == self.dataTask else { return }
             if let error, (error as NSError).code != NSURLErrorCancelled {
+                TStreamDiagnostics.log(
+                    "source: request \(self.attempt) ended after \(self.receivedBytes) bytes")
+                // The server answered and then dropped the connection without
+                // ever sending a byte of media. That is not a network fault to
+                // retry blindly: the request was accepted and the stream behind
+                // it failed to start — a tuner already in use, a service that
+                // cannot be subscribed, or a profile that cannot carry this
+                // channel. Say so, because "the network connection was lost"
+                // sends everyone looking in the wrong place.
+                if self.receivedBytes == 0 {
+                    TStreamDiagnostics.log(
+                        "source: the server sent no data before closing — \(error.localizedDescription)")
+                    // Tuning takes a moment to become possible again: a server
+                    // still releasing the previous subscription answers and then
+                    // drops the connection, and the same request a moment later
+                    // succeeds. Worth exactly one retry — after that the refusal
+                    // is real and the caller should hear about it.
+                    if !self.retriedEmptyResponse {
+                        self.retriedEmptyResponse = true
+                        self.dataTask = nil
+                        let offset = self.rangeOffset
+                        TStreamDiagnostics.log("source: retrying once")
+                        self.queue.asyncAfter(deadline: .now() + Self.emptyResponseRetryDelay) {
+                            [weak self] in self?.startRequest(rangeOffset: offset)
+                        }
+                        return
+                    }
+                    self.fail(.transport("the server accepted the request but sent no stream"))
+                    return
+                }
                 self.fail(.transport(error.localizedDescription))
                 return
             }

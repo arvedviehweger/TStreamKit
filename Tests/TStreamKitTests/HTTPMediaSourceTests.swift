@@ -7,11 +7,25 @@ import XCTest
 final class StubURLProtocol: URLProtocol {
     static var body = Data()
     static var contentType: String?
+    /// How many attempts answer with headers and then drop the connection
+    /// without a byte of body — what a server does when it accepts the request
+    /// but the stream behind it fails to start.
+    static var emptyFailures = 0
+    static private(set) var attempts = 0
 
     override class func canInit(with request: URLRequest) -> Bool { true }
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
 
     override func startLoading() {
+        Self.attempts += 1
+        if Self.emptyFailures > 0 {
+            Self.emptyFailures -= 1
+            let response = HTTPURLResponse(url: request.url!, statusCode: 200,
+                                           httpVersion: "HTTP/1.1", headerFields: [:])!
+            client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+            client?.urlProtocol(self, didFailWithError: URLError(.networkConnectionLost))
+            return
+        }
         var headers = ["Content-Length": "\(Self.body.count)"]
         if let type = Self.contentType { headers["Content-Type"] = type }
         let response = HTTPURLResponse(url: request.url!, statusCode: 200,
@@ -22,6 +36,8 @@ final class StubURLProtocol: URLProtocol {
     }
 
     override func stopLoading() {}
+
+    static func resetAttempts() { attempts = 0 }
 
     static func configuration() -> URLSessionConfiguration {
         let config = URLSessionConfiguration.ephemeral
@@ -69,10 +85,74 @@ final class MediaSourceSpy: MediaSourceDelegate {
 final class HTTPMediaSourceTests: XCTestCase {
     private let url = URL(string: "http://stream.test/channel/1")!
 
+    override func setUp() {
+        super.setUp()
+        StubURLProtocol.emptyFailures = 0
+        StubURLProtocol.resetAttempts()
+    }
+
     override func tearDown() {
         StubURLProtocol.body = Data()
         StubURLProtocol.contentType = nil
+        StubURLProtocol.emptyFailures = 0
         super.tearDown()
+    }
+
+    /// A live stream that dies before its first byte is worth one more try: a
+    /// server still releasing the previous subscription answers and then hangs
+    /// up, and the same request a moment later works.
+    func testStreamThatStartsWithNoDataIsRetriedOnce() {
+        StubURLProtocol.emptyFailures = 1
+        StubURLProtocol.body = Data(Self.transportStream())
+
+        let spy = MediaSourceSpy()
+        let source = HTTPMediaSource(url: url, configuration: StubURLProtocol.configuration())
+        source.delegate = spy
+        source.start()
+
+        wait(for: [spy.received], timeout: 5)
+        source.stop()
+
+        XCTAssertEqual(StubURLProtocol.attempts, 2)
+        XCTAssertEqual(spy.errors, [])
+        XCTAssertEqual(spy.video.first?.pts, 9000)
+    }
+
+    /// Twice is not bad luck. The second refusal is reported instead of being
+    /// retried forever, and it says what actually happened.
+    func testAServerThatKeepsSendingNothingIsReported() {
+        StubURLProtocol.emptyFailures = 5
+        StubURLProtocol.body = Data(Self.transportStream())
+
+        let spy = MediaSourceSpy()
+        let source = HTTPMediaSource(url: url, configuration: StubURLProtocol.configuration())
+        source.delegate = spy
+        let failed = expectation(description: "reported the refusal")
+        source.onError = { _ in failed.fulfill() }
+        source.start()
+
+        wait(for: [failed], timeout: 5)
+        source.stop()
+
+        XCTAssertEqual(StubURLProtocol.attempts, 2)
+        guard case .transport(let message)? = spy.errors.first else {
+            return XCTFail("expected a transport error, got \(spy.errors)")
+        }
+        XCTAssertTrue(message.contains("sent no stream"), message)
+    }
+
+    /// A short MPEG-TS stream carrying one complete H.264 access unit.
+    private static func transportStream() -> [UInt8] {
+        let videoPID: UInt16 = 0x0100
+        var stream: [UInt8] = []
+        stream += TS.packet(pid: 0x0000, payloadUnitStart: true, payload: TS.pat(pmtPID: 0x1000))
+        stream += TS.packet(pid: 0x1000, payloadUnitStart: true,
+                            payload: TS.pmt(videoPID: videoPID, audio: [(0x0F, 0x0101, [])]))
+        stream += TS.packet(pid: videoPID, payloadUnitStart: true,
+                            payload: TS.pes(streamID: 0xE0, pts: 9000, payload: [0x00, 0x00, 0x01, 0x65]))
+        stream += TS.packet(pid: videoPID, payloadUnitStart: true, continuityCounter: 1,
+                            payload: TS.pes(streamID: 0xE0, pts: 12600, payload: [0x00, 0x00, 0x01, 0x41]))
+        return stream
     }
 
     /// A `pass` profile stream: the source has to recognise MPEG-TS and route it
