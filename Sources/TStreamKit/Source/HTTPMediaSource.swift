@@ -24,8 +24,10 @@ final class HTTPMediaSource: MediaSource {
     private var failed = false
     private var stopped = false
 
-    init(url: URL, headers: [String: String] = [:], configuration: URLSessionConfiguration = .default) {
-        self.stream = HTTPByteStream(url: url, headers: headers, queue: queue, configuration: configuration)
+    init(url: URL, headers: [String: String] = [:], credential: URLCredential? = nil,
+         configuration: URLSessionConfiguration = .default) {
+        self.stream = HTTPByteStream(url: url, headers: headers, credential: credential,
+                                     queue: queue, configuration: configuration)
         stream.onData = { [weak self] data in self?.ingest(data) }
         stream.onFinish = { [weak self] in self?.demuxer?.finish() }
         stream.onReset = { [weak self] in self?.demuxer?.reset() }

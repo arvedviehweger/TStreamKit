@@ -115,8 +115,10 @@ final class TStreamSampleBufferPlayer: NSObject {
     private let highWaterSeconds = 4.0
     private let lowWaterSeconds = 2.0
 
-    convenience init(url: URL, headers: [String: String] = [:]) {
-        self.init(source: HTTPMediaSource(url: url, headers: headers))
+    convenience init(url: URL,
+                     headers: [String: String] = [:],
+                     credential: URLCredential? = nil) {
+        self.init(source: HTTPMediaSource(url: url, headers: headers, credential: credential))
     }
 
     init(source: MediaSource) {

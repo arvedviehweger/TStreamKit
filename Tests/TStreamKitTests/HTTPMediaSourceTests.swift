@@ -143,3 +143,76 @@ final class HTTPMediaSourceTests: XCTestCase {
         }
     }
 }
+
+
+// MARK: - Auth challenges
+
+/// A challenge needs a sender; nothing here is ever called.
+private final class NullChallengeSender: NSObject, URLAuthenticationChallengeSender {
+    func use(_ credential: URLCredential, for challenge: URLAuthenticationChallenge) {}
+    func continueWithoutCredential(for challenge: URLAuthenticationChallenge) {}
+    func cancel(_ challenge: URLAuthenticationChallenge) {}
+}
+
+/// A Digest-only server answers a Basic header with 401 and closes the
+/// connection, which reaches the client as a lost connection rather than as an
+/// auth failure. The challenge has to be answered for those servers to work.
+final class HTTPByteStreamAuthTests: XCTestCase {
+    private let url = URL(string: "http://stream.test/channel/1")!
+    private let credential = URLCredential(user: "u", password: "p", persistence: .forSession)
+
+    private func challenge(_ method: String, failures: Int = 0) -> URLAuthenticationChallenge {
+        let space = URLProtectionSpace(host: "stream.test", port: 9981, protocol: "http",
+                                       realm: "tvheadend", authenticationMethod: method)
+        return URLAuthenticationChallenge(protectionSpace: space, proposedCredential: nil,
+                                          previousFailureCount: failures, failureResponse: nil,
+                                          error: nil, sender: NullChallengeSender())
+    }
+
+    private func disposition(
+        for challenge: URLAuthenticationChallenge, credential: URLCredential?
+    ) -> (URLSession.AuthChallengeDisposition, URLCredential?) {
+        let stream = HTTPByteStream(url: url, credential: credential,
+                                    queue: DispatchQueue(label: "test"))
+        let task = URLSession.shared.dataTask(with: url)   // never resumed
+        var result: (URLSession.AuthChallengeDisposition, URLCredential?)!
+        stream.urlSession(.shared, task: task, didReceive: challenge) { result = ($0, $1) }
+        return result
+    }
+
+    func testDigestChallengeIsAnsweredWithTheCredential() {
+        let (disposition, used) = disposition(for: challenge(NSURLAuthenticationMethodHTTPDigest),
+                                              credential: credential)
+        XCTAssertEqual(disposition, .useCredential)
+        XCTAssertEqual(used?.user, "u")
+    }
+
+    func testBasicChallengeIsAnsweredToo() {
+        let (disposition, _) = disposition(for: challenge(NSURLAuthenticationMethodHTTPBasic),
+                                           credential: credential)
+        XCTAssertEqual(disposition, .useCredential)
+    }
+
+    /// Wrong credentials must not be offered again — that loops. Letting the
+    /// 401 through instead turns the hang into a reportable status code.
+    func testAFailedAttemptIsNotRepeated() {
+        let (disposition, used) = disposition(
+            for: challenge(NSURLAuthenticationMethodHTTPDigest, failures: 1),
+            credential: credential)
+        XCTAssertEqual(disposition, .performDefaultHandling)
+        XCTAssertNil(used)
+    }
+
+    func testWithoutCredentialsTheChallengeIsLeftToTheSystem() {
+        let (disposition, _) = disposition(for: challenge(NSURLAuthenticationMethodHTTPDigest),
+                                           credential: nil)
+        XCTAssertEqual(disposition, .performDefaultHandling)
+    }
+
+    /// Server trust is not ours to answer: the system's evaluation stands.
+    func testServerTrustIsLeftToTheSystem() {
+        let (disposition, _) = disposition(for: challenge(NSURLAuthenticationMethodServerTrust),
+                                           credential: credential)
+        XCTAssertEqual(disposition, .performDefaultHandling)
+    }
+}

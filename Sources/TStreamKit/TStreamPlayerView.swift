@@ -36,6 +36,7 @@ public final class TStreamPlayerHandle {
 public struct TStreamPlayerView: View {
     private let url: URL
     private let headers: [String: String]
+    private var credential: URLCredential?
     private let autoPlay: Bool
     private var isPaused: Bool = false
     private var handle: TStreamPlayerHandle?
@@ -96,8 +97,22 @@ public struct TStreamPlayerView: View {
         return copy
     }
 
+    /// Credentials for an HTTP auth challenge.
+    ///
+    /// An `Authorization` header passed to `init` covers Basic and saves a round
+    /// trip, but a server configured for Digest never accepts it: it answers
+    /// `401` and closes the connection, which arrives as a transport failure
+    /// rather than as an auth error. Give the credentials here and the challenge
+    /// is answered properly, whichever scheme the server asks for.
+    public func credential(_ credential: URLCredential?) -> TStreamPlayerView {
+        var copy = self
+        copy.credential = credential
+        return copy
+    }
+
     public var body: some View {
-        _TStreamPlayerContainer(url: url, headers: headers, autoPlay: autoPlay,
+        _TStreamPlayerContainer(url: url, headers: headers, credential: credential,
+                                autoPlay: autoPlay,
                                 isPaused: isPaused, handle: handle, onError: onError,
                                 onReady: onReady, onAudioOnly: onAudioOnly, onProgress: onProgress)
     }
@@ -108,6 +123,7 @@ public struct TStreamPlayerView: View {
 private struct _TStreamPlayerContainer: View {
     let url: URL
     let headers: [String: String]
+    let credential: URLCredential?
     let autoPlay: Bool
     let isPaused: Bool
     let handle: TStreamPlayerHandle?
@@ -126,7 +142,8 @@ private struct _TStreamPlayerContainer: View {
             }
         }
         .onAppear {
-            model.configure(url: url, headers: headers, autoPlay: autoPlay,
+            model.configure(url: url, headers: headers, credential: credential,
+                            autoPlay: autoPlay,
                             onError: onError, onReady: onReady, onAudioOnly: onAudioOnly,
                             onProgress: onProgress)
             handle?.player = model.player
@@ -144,12 +161,13 @@ private struct _TStreamPlayerContainer: View {
 private final class PlayerModel: ObservableObject {
     @Published private(set) var player: TStreamSampleBufferPlayer?
 
-    func configure(url: URL, headers: [String: String], autoPlay: Bool,
+    func configure(url: URL, headers: [String: String], credential: URLCredential?,
+                   autoPlay: Bool,
                    onError: ((TStreamError) -> Void)?, onReady: (() -> Void)?,
                    onAudioOnly: (() -> Void)?,
                    onProgress: ((TimeInterval) -> Void)?) {
         guard player == nil else { return }
-        let player = TStreamSampleBufferPlayer(url: url, headers: headers)
+        let player = TStreamSampleBufferPlayer(url: url, headers: headers, credential: credential)
         player.onError = onError
         player.onReadyToPlay = onReady
         player.onAudioOnly = onAudioOnly

@@ -21,6 +21,10 @@ final class HTTPByteStream: NSObject {
 
     private let httpURL: URL
     private let httpHeaders: [String: String]
+    /// Credentials for an HTTP auth challenge. A pre-set `Authorization` header
+    /// only covers Basic; a server that asks for Digest has to be answered, and
+    /// answering needs the password rather than a header derived from it.
+    private let credential: URLCredential?
     private let queue: DispatchQueue
     private lazy var session = URLSession(configuration: configuration, delegate: self, delegateQueue: nil)
     private let configuration: URLSessionConfiguration
@@ -54,10 +58,12 @@ final class HTTPByteStream: NSObject {
 
     init(url: URL,
          headers: [String: String] = [:],
+         credential: URLCredential? = nil,
          queue: DispatchQueue,
          configuration: URLSessionConfiguration = .default) {
         self.httpURL = url
         self.httpHeaders = headers
+        self.credential = credential
         self.queue = queue
         self.configuration = configuration
         super.init()
@@ -150,6 +156,32 @@ final class HTTPByteStream: NSObject {
 }
 
 extension HTTPByteStream: URLSessionDataDelegate {
+    /// Answers Basic and Digest challenges with the credentials the caller gave
+    /// us. Without this a Digest-only server refuses the request and hangs up:
+    /// it sends `401` with `Connection: Close` and closes before the response is
+    /// read, which surfaces as a lost connection rather than as an auth failure.
+    ///
+    /// Only the first attempt is answered. Retrying wrong credentials loops, and
+    /// letting the 401 through instead turns a hang into a clear "HTTP 401".
+    func urlSession(_ session: URLSession, task: URLSessionTask,
+                    didReceive challenge: URLAuthenticationChallenge,
+                    completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void) {
+        switch challenge.protectionSpace.authenticationMethod {
+        case NSURLAuthenticationMethodHTTPBasic,
+             NSURLAuthenticationMethodHTTPDigest,
+             NSURLAuthenticationMethodDefault:
+            guard let credential, challenge.previousFailureCount == 0 else {
+                completionHandler(.performDefaultHandling, nil)
+                return
+            }
+            TStreamDiagnostics.log(
+                "source: answering an auth challenge (\(challenge.protectionSpace.authenticationMethod))")
+            completionHandler(.useCredential, credential)
+        default:
+            completionHandler(.performDefaultHandling, nil)
+        }
+    }
+
     func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
         queue.async {
             // Drop bytes from a task we've already replaced (e.g. after a seek).
