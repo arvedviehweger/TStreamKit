@@ -49,6 +49,7 @@ final class StubURLProtocol: URLProtocol {
 /// Collects what the source hands the player.
 final class MediaSourceSpy: MediaSourceDelegate {
     var video: [(codec: VideoCodec, pts: UInt64)] = []
+    var videoKeyframes: [Bool] = []
     var videoData: [Data] = []
     var videoFormats: [(codec: VideoCodec, extradata: Data?, pixelAspect: PixelAspect?)] = []
     var audioFormats: [AudioFormat] = []
@@ -62,8 +63,10 @@ final class MediaSourceSpy: MediaSourceDelegate {
         videoFormats.append((codec, extradata, pixelAspect))
     }
 
-    func mediaSource(_ s: MediaSource, didProduceVideo data: Data, codec: VideoCodec, pts: UInt64, dts: UInt64) {
+    func mediaSource(_ s: MediaSource, didProduceVideo data: Data, codec: VideoCodec,
+                     pts: UInt64, dts: UInt64, isKeyframe: Bool) {
         video.append((codec, pts))
+        videoKeyframes.append(isKeyframe)
         videoData.append(data)
         received.fulfill()
     }

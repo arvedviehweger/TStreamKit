@@ -475,7 +475,10 @@ extension TStreamSampleBufferPlayer: MediaSourceDelegate {
         }
     }
 
-    func mediaSource(_ s: MediaSource, didProduceVideo data: Data, codec: VideoCodec, pts: UInt64, dts: UInt64) {
+    func mediaSource(_ s: MediaSource, didProduceVideo data: Data, codec: VideoCodec,
+                     pts: UInt64, dts: UInt64, isKeyframe: Bool) {
+        // `isKeyframe` is for the timeshift buffer's benefit; libavcodec finds
+        // its own restart point, so the decode path ignores it.
         renderQueue.async { [weak self] in self?.ingestRawVideo(data, codec: codec, pts: pts, dts: dts) }
     }
 

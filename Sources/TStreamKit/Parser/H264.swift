@@ -94,6 +94,40 @@ enum H264 {
         return (out, syncType != .none, startsSegment, syncType)
     }
 
+    /// Sync classification for a whole access unit, without building its sample
+    /// data. The timeshift buffer uses this to find the points a freshly created
+    /// decoder can be started from; the muxing path gets the same answer as a
+    /// by-product of `avccSample`.
+    static func syncType(in nals: [NAL]) -> VideoSyncType {
+        var result: VideoSyncType = .none
+        for nal in nals {
+            switch nal.type {
+            case NALType.idr.rawValue:
+                return .idr
+            case NALType.nonIDR.rawValue:
+                if result == .none, isISlice(headerOf: nal) { result = .nonIDRIntra }
+            default:
+                continue
+            }
+        }
+        return result
+    }
+
+    /// `isISlice` limited to the start of the NAL. `slice_type` is the second
+    /// field of the slice header, so a few dozen bytes always cover it — while a
+    /// coded slice can be hundreds of kilobytes that would otherwise be copied
+    /// in full for every frame of a live stream.
+    private static func isISlice(headerOf nal: NAL) -> Bool {
+        let rbsp = ebspToRBSP(nal.bytes.prefix(sliceHeaderProbeBytes))
+        guard !rbsp.isEmpty else { return false }
+        var reader = BitReader(rbsp)
+        _ = reader.readUE()                        // first_mb_in_slice
+        guard let sliceType = reader.readUE() else { return false }
+        return sliceType % 5 == 2
+    }
+
+    private static let sliceHeaderProbeBytes = 48
+
     /// True when a coded-slice NAL holds an I-slice. The slice header begins at
     /// the byte after the 1-byte NAL header with `first_mb_in_slice` (ue) then
     /// `slice_type` (ue); `slice_type % 5 == 2` is an I-slice (values 2 and 7).

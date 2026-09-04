@@ -43,9 +43,10 @@ protocol MediaSourceDelegate: AnyObject {
     func mediaSource(_ source: MediaSource, didParseVideoFormat codec: VideoCodec, extradata: Data?,
                      pixelAspect: PixelAspect?)
     /// One chunk of the video stream. Annex-B bytes to be parsed when no format
-    /// was announced, otherwise exactly one already-framed packet.
+    /// was announced, otherwise exactly one already-framed packet. `isKeyframe`
+    /// marks a random-access point, which only the timeshift buffer reads.
     func mediaSource(_ source: MediaSource, didProduceVideo data: Data,
-                     codec: VideoCodec, pts: UInt64, dts: UInt64)
+                     codec: VideoCodec, pts: UInt64, dts: UInt64, isKeyframe: Bool)
     /// The stream has no video: only audio will ever be produced. Sent once,
     /// before any packet, so the player can anchor its clock on the audio
     /// instead of waiting for a first frame.

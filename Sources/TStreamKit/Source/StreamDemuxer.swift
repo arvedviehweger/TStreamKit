@@ -48,7 +48,9 @@ protocol StreamDemuxerOutput: AnyObject {
     /// CodecPrivate). MPEG-TS carries this in the stream itself and never calls
     /// this, which is what keeps its decode path unchanged.
     func demuxerDidParseVideoFormat(_ codec: VideoCodec, extradata: Data?, pixelAspect: PixelAspect?)
-    func demuxerDidProduceVideo(_ data: Data, codec: VideoCodec, pts: UInt64, dts: UInt64)
+    /// `isKeyframe` marks a random-access point. The decode path ignores it;
+    /// the timeshift buffer needs it to know where a rewind can restart.
+    func demuxerDidProduceVideo(_ data: Data, codec: VideoCodec, pts: UInt64, dts: UInt64, isKeyframe: Bool)
     /// The stream carries no video we can show — a radio channel, or a picture
     /// in a codec we have no decoder for. Reported once, before any packet: a
     /// player that waits for a first frame to start its clock would otherwise
@@ -99,8 +101,9 @@ extension TSStreamDemuxer: TSDemuxerDelegate {
         TStreamDiagnostics.log("ts: the programme carries audio only")
         output?.demuxerDidDetectAudioOnly()
     }
-    func demuxer(_ d: TSDemuxer, didProduceRawVideo data: Data, codec: VideoCodec, pts: UInt64, dts: UInt64) {
-        output?.demuxerDidProduceVideo(data, codec: codec, pts: pts, dts: dts)
+    func demuxer(_ d: TSDemuxer, didProduceRawVideo data: Data, codec: VideoCodec,
+                 pts: UInt64, dts: UInt64, isKeyframe: Bool) {
+        output?.demuxerDidProduceVideo(data, codec: codec, pts: pts, dts: dts, isKeyframe: isKeyframe)
     }
     func demuxer(_ d: TSDemuxer, didParseAudioFormat format: AudioFormat) {
         output?.demuxerDidParseAudioFormat(format)

@@ -67,8 +67,11 @@ protocol TSDemuxerDelegate: AnyObject {
     /// Called once the PMT is parsed, reporting which elementary streams exist.
     func demuxer(_ demuxer: TSDemuxer, didIdentifyStreamsHasVideo hasVideo: Bool, hasAudio: Bool)
     /// Raw-mode only: the unprocessed (Annex-B) video PES payload, for decoders
-    /// (libavcodec) that do their own NAL/field/frame assembly.
-    func demuxer(_ demuxer: TSDemuxer, didProduceRawVideo data: Data, codec: VideoCodec, pts: UInt64, dts: UInt64)
+    /// (libavcodec) that do their own NAL/field/frame assembly. `isKeyframe`
+    /// marks a random-access point — nothing on the decode path needs it, but
+    /// the timeshift buffer can only restart a decoder from one.
+    func demuxer(_ demuxer: TSDemuxer, didProduceRawVideo data: Data, codec: VideoCodec,
+                 pts: UInt64, dts: UInt64, isKeyframe: Bool)
 }
 
 // Everything except the audio and failure callbacks is optional: a raw-video
@@ -76,7 +79,8 @@ protocol TSDemuxerDelegate: AnyObject {
 // muxing consumer never sees raw video.
 extension TSDemuxerDelegate {
     func demuxer(_ demuxer: TSDemuxer, didIdentifyStreamsHasVideo hasVideo: Bool, hasAudio: Bool) {}
-    func demuxer(_ demuxer: TSDemuxer, didProduceRawVideo data: Data, codec: VideoCodec, pts: UInt64, dts: UInt64) {}
+    func demuxer(_ demuxer: TSDemuxer, didProduceRawVideo data: Data, codec: VideoCodec,
+                 pts: UInt64, dts: UInt64, isKeyframe: Bool) {}
     func demuxer(_ demuxer: TSDemuxer, didParseVideoFormat format: VideoFormat) {}
     func demuxer(_ demuxer: TSDemuxer, didProduceVideo unit: AccessUnit) {}
 }
@@ -370,7 +374,8 @@ final class TSDemuxer {
         let elementary = Array(bytes[header.payloadOffset...])
         if rawVideoMode, let codec = videoCodec {
             delegate?.demuxer(self, didProduceRawVideo: Data(elementary), codec: codec,
-                              pts: header.pts, dts: header.dts)
+                              pts: header.pts, dts: header.dts,
+                              isKeyframe: Self.isRawSyncPoint(elementary, codec: codec))
             return
         }
         switch videoCodec {
@@ -380,6 +385,34 @@ final class TSDemuxer {
         case .vp8: break     // only ever arrives via a container, never in TS
         case .none: break
         }
+    }
+
+    /// Whether a raw (Annex-B) video payload is a point a freshly created
+    /// decoder can be started from. Only the timeshift buffer consumes this;
+    /// the decoder itself is handed every payload regardless.
+    ///
+    /// MPEG-2 has no NAL structure, so the marker is the sequence header that
+    /// broadcast muxes repeat ahead of every I-frame.
+    private static func isRawSyncPoint(_ elementary: [UInt8], codec: VideoCodec) -> Bool {
+        switch codec {
+        case .h264:
+            return H264.syncType(in: H264.splitNALUnits(elementary)) != .none
+        case .h265:
+            return HEVC.hasIRAP(in: HEVC.splitNALUnits(elementary))
+        case .mpeg2:
+            return hasMPEG2SequenceHeader(elementary)
+        case .vp8:
+            return false        // only ever arrives via a container
+        }
+    }
+
+    /// Scans for the MPEG-2 `sequence_header_code` (`00 00 01 B3`).
+    private static func hasMPEG2SequenceHeader(_ bytes: [UInt8]) -> Bool {
+        guard bytes.count >= 4 else { return false }
+        for i in 0...(bytes.count - 4) where bytes[i] == 0 && bytes[i + 1] == 0 {
+            if bytes[i + 2] == 1, bytes[i + 3] == 0xB3 { return true }
+        }
+        return false
     }
 
     private func completeH264(_ elementary: [UInt8], header: (pts: UInt64, dts: UInt64, payloadOffset: Int)) {

@@ -274,7 +274,8 @@ final class FFStreamDemuxer: StreamDemuxer {
 
         if packet.is_video != 0 {
             guard let codec = videoCodecForPackets else { return }
-            output?.demuxerDidProduceVideo(data, codec: codec, pts: pts, dts: dts)
+            output?.demuxerDidProduceVideo(data, codec: codec, pts: pts, dts: dts,
+                                           isKeyframe: packet.keyframe != 0)
         } else if let audioDecoder {
             for block in audioDecoder.decode(data, pts: pts) {
                 let stamp = pcmTimeline.stamp(container: block.pts, frames: block.frames)

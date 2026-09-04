@@ -10,13 +10,16 @@ final class DemuxerSpy: TSDemuxerDelegate {
     var hasAudio = false
     var errors: [TStreamError] = []
     var rawVideo: [(codec: VideoCodec, pts: UInt64)] = []
+    var rawVideoKeyframes: [Bool] = []
 
     func demuxer(_ d: TSDemuxer, didParseVideoFormat format: VideoFormat) { videoFormat = format }
     func demuxer(_ d: TSDemuxer, didParseAudioFormat format: AudioFormat) { audioFormat = format }
     func demuxer(_ d: TSDemuxer, didProduceVideo unit: AccessUnit) { videoUnits.append(unit) }
     func demuxer(_ d: TSDemuxer, didProduceAudio unit: AccessUnit) { audioUnits.append(unit) }
-    func demuxer(_ d: TSDemuxer, didProduceRawVideo data: Data, codec: VideoCodec, pts: UInt64, dts: UInt64) {
+    func demuxer(_ d: TSDemuxer, didProduceRawVideo data: Data, codec: VideoCodec,
+                 pts: UInt64, dts: UInt64, isKeyframe: Bool) {
         rawVideo.append((codec, pts))
+        rawVideoKeyframes.append(isKeyframe)
     }
     func demuxer(_ d: TSDemuxer, didFail error: TStreamError) { errors.append(error) }
     func demuxer(_ d: TSDemuxer, didIdentifyStreamsHasVideo v: Bool, hasAudio a: Bool) {
@@ -30,7 +33,7 @@ private final class StreamOutputSpy: StreamDemuxerOutput {
     var audioFormats: [AudioFormat] = []
 
     func demuxerDidParseVideoFormat(_ codec: VideoCodec, extradata: Data?, pixelAspect: PixelAspect?) {}
-    func demuxerDidProduceVideo(_ data: Data, codec: VideoCodec, pts: UInt64, dts: UInt64) {}
+    func demuxerDidProduceVideo(_ data: Data, codec: VideoCodec, pts: UInt64, dts: UInt64, isKeyframe: Bool) {}
     func demuxerDidDetectAudioOnly() { audioOnlyReports += 1 }
     func demuxerDidParseAudioFormat(_ format: AudioFormat) { audioFormats.append(format) }
     func demuxerDidProduceAudio(_ unit: AccessUnit) {}
@@ -170,6 +173,39 @@ final class TSDemuxerTests: XCTestCase {
         XCTAssertEqual(spy.rawVideo.count, 1)
         XCTAssertEqual(spy.rawVideo.first?.codec, .mpeg2)
         XCTAssertEqual(spy.rawVideo.first?.pts, 9000)
+        // A sequence header is where an MPEG-2 decoder can be restarted, which
+        // is what the timeshift buffer rewinds to.
+        XCTAssertEqual(spy.rawVideoKeyframes, [true])
+    }
+
+    /// Raw mode still has to say which payloads are random-access points: the
+    /// decoder ignores the flag, but a rewind can only restart on one.
+    func testRawVideoMarksSyncPoints() {
+        let spy = DemuxerSpy()
+        let demuxer = TSDemuxer()
+        demuxer.delegate = spy
+        demuxer.rawVideoMode = true
+
+        let parser = TSPacketParser()
+        let videoPID: UInt16 = 0x0100
+        // NAL type 5 = IDR; type 1 with slice_type=0 (ue "1") = a P-slice.
+        let idr = TS.annexB([[0x65, 0x88, 0x99, 0xAA]])
+        let nonIDRP = TS.annexB([[0x41, 0x80]])
+
+        var stream: [UInt8] = []
+        stream += TS.packet(pid: 0x0000, payloadUnitStart: true, payload: TS.pat(pmtPID: 0x1000))
+        stream += TS.packet(pid: 0x1000, payloadUnitStart: true, payload: TS.pmt(
+            videoPID: videoPID, videoStreamType: 0x1B, audio: [(0x03, 0x0101, [])]))
+        stream += TS.packet(pid: videoPID, payloadUnitStart: true, continuityCounter: 0,
+                            payload: TS.pes(streamID: 0xE0, pts: 9000, payload: idr))
+        stream += TS.packet(pid: videoPID, payloadUnitStart: true, continuityCounter: 1,
+                            payload: TS.pes(streamID: 0xE0, pts: 12600, payload: nonIDRP))
+
+        for packet in parser.push(Data(stream)) { demuxer.consume(packet) }
+        demuxer.flush()
+
+        XCTAssertEqual(spy.rawVideo.count, 2)
+        XCTAssertEqual(spy.rawVideoKeyframes, [true, false])
     }
 
     func testDVBPrivateStreamWithoutAC3DescriptorIsNotAudio() {

@@ -25,6 +25,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   labels its output AAC Main — tvheadend's `webtv-h264-aac-mpegts` profile does
   — played its video in silence.
 
+### Changed
+- Demuxers now report whether a video packet is a random-access point. The
+  decode path ignores it — libavcodec finds its own restart point — but a
+  rewind can only resume from one.
+
 ## [1.2.0] - 2026-08-14
 
 ### Fixed

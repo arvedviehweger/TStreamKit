@@ -81,6 +81,12 @@ enum HEVC {
         return (out, keyframe)
     }
 
+    /// Whether the access unit carries an IRAP picture — the counterpart of
+    /// `H264.syncType(in:)` for finding decoder restart points.
+    static func hasIRAP(in nals: [NAL]) -> Bool {
+        nals.contains { NALType.irapRange.contains($0.type) }
+    }
+
     struct Dimensions { let width: Int; let height: Int }
 
     /// Fields lifted from the SPS that the `hvcC` record needs verbatim.

@@ -128,8 +128,9 @@ extension HTTPMediaSource: StreamDemuxerOutput {
     func demuxerDidParseVideoFormat(_ codec: VideoCodec, extradata: Data?, pixelAspect: PixelAspect?) {
         delegate?.mediaSource(self, didParseVideoFormat: codec, extradata: extradata, pixelAspect: pixelAspect)
     }
-    func demuxerDidProduceVideo(_ data: Data, codec: VideoCodec, pts: UInt64, dts: UInt64) {
-        delegate?.mediaSource(self, didProduceVideo: data, codec: codec, pts: pts, dts: dts)
+    func demuxerDidProduceVideo(_ data: Data, codec: VideoCodec, pts: UInt64, dts: UInt64, isKeyframe: Bool) {
+        delegate?.mediaSource(self, didProduceVideo: data, codec: codec, pts: pts, dts: dts,
+                              isKeyframe: isKeyframe)
     }
     func demuxerDidDetectAudioOnly() {
         delegate?.mediaSourceDidDetectAudioOnly(self)
