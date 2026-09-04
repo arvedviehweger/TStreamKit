@@ -1,12 +1,7 @@
 import Foundation
 
-/// The stream source the player uses: fetches over HTTP, works out which
-/// container the server sent, and runs the matching demuxer.
-///
-/// Detection happens on the live connection rather than through a separate
-/// probe request. A transcoding server starts a session per connection, so
-/// opening a second one to sniff would both cost a round trip and leave a
-/// stray session behind.
+/// The stream source the player uses for anything served over HTTP: fetches
+/// the bytes and hands them to the shared container pipeline.
 ///
 /// All delegate callbacks are delivered on the private `queue`.
 final class HTTPMediaSource: MediaSource {
@@ -15,12 +10,7 @@ final class HTTPMediaSource: MediaSource {
 
     private let queue = DispatchQueue(label: "com.tstream.source")
     private let stream: HTTPByteStream
-
-    /// Bytes held back until the container is known, then replayed into the
-    /// demuxer. Empty once detection has finished.
-    private var probeBuffer: [UInt8] = []
-    private var format: ContainerFormat?
-    private var demuxer: StreamDemuxer?
+    private let pipeline = ContainerPipeline()
     private var failed = false
     private var stopped = false
 
@@ -28,9 +18,11 @@ final class HTTPMediaSource: MediaSource {
          configuration: URLSessionConfiguration = .default) {
         self.stream = HTTPByteStream(url: url, headers: headers, credential: credential,
                                      queue: queue, configuration: configuration)
+        pipeline.output = self
+        pipeline.onFail = { [weak self] error in self?.fail(error) }
         stream.onData = { [weak self] data in self?.ingest(data) }
-        stream.onFinish = { [weak self] in self?.demuxer?.finish() }
-        stream.onReset = { [weak self] in self?.demuxer?.reset() }
+        stream.onFinish = { [weak self] in self?.pipeline.finish() }
+        stream.onReset = { [weak self] in self?.pipeline.reset() }
         stream.onError = { [weak self] error in self?.fail(error) }
     }
 
@@ -44,15 +36,13 @@ final class HTTPMediaSource: MediaSource {
             self.stopped = true
             self.delegate = nil
             self.onError = nil
-            self.demuxer?.stop()
-            self.demuxer = nil
-            self.probeBuffer.removeAll()
+            self.pipeline.stop()
         }
     }
 
     /// Only a finite resource (a recording) has a length to seek within, and a
     /// container we never identified can't be seeked into either.
-    var isSeekable: Bool { stream.length > 0 && format != nil }
+    var isSeekable: Bool { stream.length > 0 && pipeline.isIdentified }
 
     /// Seeks by byte offset, which is what the sources we support can actually
     /// do: TS resyncs to the next packet from anywhere, and the libavformat path
@@ -67,50 +57,10 @@ final class HTTPMediaSource: MediaSource {
         stream.seek(toByteOffset: Int64(Double(total) * clamped), completion: completion)
     }
 
-    // MARK: - Detection
-
-    /// On `queue`. Buffers until the container is known, then hands everything
-    /// to the demuxer and gets out of the way.
+    /// On `queue`.
     private func ingest(_ data: Data) {
         guard !stopped, !failed else { return }
-
-        if let demuxer {
-            demuxer.consume(data)
-            return
-        }
-
-        probeBuffer.append(contentsOf: data)
-        guard let detected = ContainerFormat.detect(probeBuffer) else {
-            if probeBuffer.count >= ContainerFormat.probeLimit {
-                fail(.demux("could not identify the container in the first \(probeBuffer.count) bytes"))
-            }
-            return
-        }
-
-        let made = makeDemuxer(for: detected)
-        made.output = self
-        format = detected
-        demuxer = made
-        TStreamDiagnostics.log("source: detected \(describe(detected)) container")
-
-        let buffered = Data(probeBuffer)
-        probeBuffer.removeAll(keepingCapacity: false)
-        made.consume(buffered)
-    }
-
-    private func makeDemuxer(for format: ContainerFormat) -> StreamDemuxer {
-        switch format {
-        case .mpegTS: return TSStreamDemuxer()
-        case .matroska, .mp4: return FFStreamDemuxer()
-        }
-    }
-
-    private func describe(_ format: ContainerFormat) -> String {
-        switch format {
-        case .mpegTS: return "MPEG-TS"
-        case .matroska: return "Matroska/WebM"
-        case .mp4: return "MP4"
-        }
+        pipeline.consume(data)
     }
 
     /// On `queue`. Reports once and then goes quiet.
