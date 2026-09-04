@@ -210,6 +210,11 @@ struct RecordingPlayer: View {
 > reports a total byte count. `onProgress` reports an **absolute** offset that
 > stays correct across seeks.
 
+A **local file** works the same way: pass a `file:` URL and TStreamKit reads it
+off disk instead of over HTTP, through the same detection and demuxers. A file
+always has a length, so a downloaded recording scrubs exactly like a streamed
+one.
+
 ### UIKit
 
 There is no separate UIKit view — host `TStreamPlayerView` in a

@@ -142,6 +142,12 @@ final class TStreamSampleBufferPlayer: NSObject {
     convenience init(url: URL,
                      headers: [String: String] = [:],
                      credential: URLCredential? = nil) {
+        // A downloaded recording is played straight off disk; `URLSession`
+        // can't fetch `file:` URLs.
+        guard !url.isFileURL else {
+            self.init(source: FileMediaSource(url: url))
+            return
+        }
         self.init(source: HTTPMediaSource(url: url, headers: headers, credential: credential))
     }
 

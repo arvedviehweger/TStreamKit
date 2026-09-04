@@ -6,6 +6,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- Playback of local files: a `file:` URL is read off disk instead of over HTTP,
+  through the same container detection and demuxers. A file always has a length,
+  so a downloaded recording scrubs like a streamed one.
+
 ### Fixed
 - Recordings no longer get the app killed for memory a few seconds in on a
   fast link (an Apple TV on gigabit Ethernet) or from a local file. The buffer
