@@ -7,6 +7,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Fixed
+- A recording no longer stops with "The request timed out" after a long pause.
+  A suspended request keeps running its timeout, so a pause longer than 20 s —
+  the viewer's own, or the source held back while the buffer drains — killed
+  the connection. A recording whose connection breaks off mid-file now
+  continues from the next byte with a `Range` request (after `resume()` if it
+  is paused), and gives up only after three reconnects that bring no data or
+  when the server answers without honouring the range.
 - AAC the system decoder refuses is now decoded here on the **MPEG-TS** path as
   well, not only in the containers libavformat reads. A transcoding server that
   labels its output AAC Main — tvheadend's `webtv-h264-aac-mpegts` profile does

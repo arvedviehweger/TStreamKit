@@ -54,6 +54,21 @@ final class HTTPByteStream: NSObject {
     /// Byte offset of the current request (0 for the initial, non-ranged fetch).
     private var rangeOffset: Int64 = 0
 
+    /// A recording whose connection broke off is picked up again where it
+    /// stopped, with a `Range` request, instead of ending playback. The usual
+    /// cause is our own backpressure: a suspended task still runs its request
+    /// timeout, so a pause longer than `stallTimeout` — the viewer pausing, or
+    /// the decode buffer taking a while to drain at a low bitrate — ends in
+    /// "The request timed out". Set while such a reconnect waits for `resume()`.
+    private var reconnectOffset: Int64?
+    /// Whether the current request continues an earlier one rather than
+    /// starting the stream or a seek. Its bytes are appended without a reset,
+    /// so a server that ignores `Range` must not be believed.
+    private var isContinuation = false
+    /// Reconnects in a row that brought no data. Reset by the first byte.
+    private var reconnectsWithoutData = 0
+    private static let maxReconnectsWithoutData = 3
+
     /// Total length of the resource, learned from the first response. 0 until
     /// known, and a live stream never reports one. Written on `queue` but read
     /// from anywhere, so it takes a lock rather than a `queue.sync` (which would
@@ -111,6 +126,8 @@ final class HTTPByteStream: NSObject {
             self.dataTask?.cancel()
             self.dataTask = nil
             self.paused = false
+            self.reconnectOffset = nil
+            self.isContinuation = false
             self.onReset?()
             self.startRequest(rangeOffset: max(0, offset))
             TStreamDiagnostics.log("source: seek to byte \(offset)")
@@ -123,6 +140,7 @@ final class HTTPByteStream: NSObject {
         guard self.failure == nil, !self.stopped else { return }
         self.rangeOffset = rangeOffset
         self.receivedBytes = 0
+        self.isContinuation = false
         var request = URLRequest(url: httpURL)
         request.setValue("identity", forHTTPHeaderField: "Accept-Encoding")
         for (field, value) in httpHeaders {
@@ -154,10 +172,23 @@ final class HTTPByteStream: NSObject {
     /// Resume once the consumer has drained its buffer back down.
     func resume() {
         queue.async {
-            guard !self.stopped, self.paused, let task = self.dataTask else { return }
+            guard !self.stopped, self.paused else { return }
             self.paused = false
-            task.resume()
+            if let offset = self.reconnectOffset {
+                self.reconnectOffset = nil
+                self.reconnect(at: offset)
+            } else {
+                self.dataTask?.resume()
+            }
         }
+    }
+
+    /// On `queue`. Continues the stream at `offset` without an `onReset`: the
+    /// consumer gets the next byte after the last one it saw.
+    private func reconnect(at offset: Int64) {
+        TStreamDiagnostics.log("source: reconnecting at byte \(offset)")
+        startRequest(rangeOffset: offset)
+        isContinuation = true
     }
 
     func stop() {
@@ -218,6 +249,7 @@ extension HTTPByteStream: URLSessionDataDelegate {
             if self.receivedBytes == 0 {
                 TStreamDiagnostics.log("source: first \(data.count) bytes arrived")
             }
+            self.reconnectsWithoutData = 0
             self.receivedBytes += data.count
             self.onData?(data)
         }
@@ -231,6 +263,18 @@ extension HTTPByteStream: URLSessionDataDelegate {
             queue.async { [weak self] in self?.fail(.transport("HTTP \(http.statusCode)")) }
             completionHandler(.cancel)
             return
+        }
+        // A continuation answered from the start of the file would splice the
+        // beginning of the recording into the middle of it.
+        if let http = response as? HTTPURLResponse, http.statusCode != 206 {
+            let continuing = queue.sync { isContinuation }
+            if continuing {
+                queue.async { [weak self] in
+                    self?.fail(.transport("the server can't resume a recording mid-file"))
+                }
+                completionHandler(.cancel)
+                return
+            }
         }
         // expectedContentLength is the length of *this* response: for a ranged
         // request that's the remainder, so add the offset to get the total.
@@ -255,6 +299,24 @@ extension HTTPByteStream: URLSessionDataDelegate {
             if let error, (error as NSError).code != NSURLErrorCancelled {
                 TStreamDiagnostics.log(
                     "source: request \(self.attempt) ended after \(self.receivedBytes) bytes")
+                // A recording that was already playing: carry on from the
+                // byte after the last one delivered. Only a finite resource
+                // can be resumed like that; a live stream has no offsets.
+                let position = self.rangeOffset + Int64(self.receivedBytes)
+                let total = self.length
+                if total > 0, position > 0, position < total,
+                   self.reconnectsWithoutData < Self.maxReconnectsWithoutData {
+                    self.reconnectsWithoutData += 1
+                    self.dataTask = nil
+                    TStreamDiagnostics.log(
+                        "source: connection lost at byte \(position) — \(error.localizedDescription)")
+                    if self.paused {
+                        self.reconnectOffset = position
+                    } else {
+                        self.reconnect(at: position)
+                    }
+                    return
+                }
                 // The server answered and then dropped the connection without
                 // ever sending a byte of media. That is not a network fault to
                 // retry blindly: the request was accepted and the stream behind
