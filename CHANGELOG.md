@@ -7,6 +7,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Fixed
+- Recordings no longer get the app killed for memory a few seconds in on a
+  fast link (an Apple TV on gigabit Ethernet) or from a local file. The buffer
+  ahead of playback is now held compressed and decoded only 1.5 s ahead of the
+  clock; before, everything already fetched when the source was throttled was
+  still decoded into full-size frames. A 1080i recording played from disk
+  peaks at roughly half the memory it did.
 - A recording no longer stops with "The request timed out" after a long pause.
   A suspended request keeps running its timeout, so a pause longer than 20 s —
   the viewer's own, or the source held back while the buffer drains — killed

@@ -106,14 +106,38 @@ final class TStreamSampleBufferPlayer: NSObject {
     /// `onError` callback it guards.
     private var reportedError = false
 
-    // Backpressure: a recording downloads as fast as the link allows, so without
-    // throttling every frame is decoded into an (uncompressed) CVPixelBuffer and
-    // piled into `videoQueue` faster than the real-time clock drains it — the app
-    // is OOM-killed within seconds. We suspend the network source once we are
-    // `highWaterSeconds` ahead of the playback clock and resume below `lowWater`.
+    // Backpressure: a recording arrives as fast as the link or the disk allows,
+    // so it has to be held back in two places. What is buffered ahead is kept
+    // *compressed* in `pendingVideo` and only decoded `decodeAheadSeconds` ahead
+    // of the clock: a decoded 1080 frame is ~3 MB, and deinterlaced to 50 fps a
+    // few seconds of them is most of an Apple TV's memory budget. Throttling
+    // after decode was not enough — suspending the source stops new bytes, but
+    // everything already handed over still got decoded, and on gigabit Ethernet
+    // that overshoot got the app OOM-killed seconds into a recording. The source
+    // itself is suspended once `maxPendingVideoBytes` are waiting (or, for a
+    // stream without video, once the audio is `highWaterSeconds` ahead) and
+    // resumed when a quarter of that has played. Short pauses matter: a
+    // suspended request still runs its timeout, and at a low bitrate draining
+    // half of the backlog took longer than that.
     private var sourcePaused = false
     private let highWaterSeconds = 4.0
     private let lowWaterSeconds = 2.0
+    /// Must stay above `prerollSeconds`, or the clock would never start.
+    private let decodeAheadSeconds = 1.5
+    private let maxPendingVideoBytes = 24 * 1024 * 1024
+
+    private struct PendingVideo {
+        let data: Data
+        let codec: VideoCodec
+        let pts: UInt64
+        let dts: UInt64
+    }
+    /// Compressed video waiting to be decoded, oldest first. On `renderQueue`.
+    private var pendingVideo: [PendingVideo] = []
+    private var pendingVideoHead = 0
+    private var pendingVideoBytes = 0
+    /// Whether a deferred `pumpDecode` is already queued.
+    private var decodePumpScheduled = false
 
     convenience init(url: URL,
                      headers: [String: String] = [:],
@@ -199,6 +223,7 @@ final class TStreamSampleBufferPlayer: NSObject {
         displayLayer.stopRequestingMediaData(); videoRequesting = false
         displayLayer.flush()
         videoQueue.removeAll()
+        clearPendingVideo()
         // Audio state lives on its own queue; flush it there and close the gate
         // so no stale pre-seek audio plays until the first post-seek keyframe.
         closeAudioGate(flush: true)
@@ -222,6 +247,7 @@ final class TStreamSampleBufferPlayer: NSObject {
             self.displayLayer.stopRequestingMediaData()
             self.videoRequesting = false
             self.videoQueue.removeAll()
+            self.clearPendingVideo()
             self.synchronizer.setRate(0, time: .invalid)
             self.displayLayer.flushAndRemoveImage()
             self.ffDecoder = nil
@@ -313,10 +339,46 @@ final class TStreamSampleBufferPlayer: NSObject {
 
     private func updateBackpressure() {
         guard !stopped, !sourcePaused else { return }
-        guard bufferedAheadSeconds() >= highWaterSeconds else { return }
+        guard pendingVideoBytes >= maxPendingVideoBytes
+                || bufferedAheadSeconds() >= highWaterSeconds else { return }
         sourcePaused = true
         source.pause()
         scheduleResumeCheck()
+    }
+
+    /// Decodes waiting video until `decodeAheadSeconds` are ready ahead of the
+    /// clock. Whatever is left is picked up by a deferred pump once the clock
+    /// has moved on — also after the source has finished, when no new packet
+    /// would trigger it.
+    private func pumpDecode() {
+        while pendingVideoHead < pendingVideo.count,
+              !stopped, !discardingUntilSeek,
+              bufferedAheadSeconds() < decodeAheadSeconds {
+            let packet = pendingVideo[pendingVideoHead]
+            pendingVideoHead += 1
+            pendingVideoBytes -= packet.data.count
+            decodeVideo(packet)
+        }
+        if pendingVideoHead == pendingVideo.count {
+            pendingVideo.removeAll(keepingCapacity: true)
+            pendingVideoHead = 0
+        } else if pendingVideoHead > 512 {
+            pendingVideo.removeFirst(pendingVideoHead)
+            pendingVideoHead = 0
+        }
+        guard pendingVideoHead < pendingVideo.count, !stopped, !decodePumpScheduled else { return }
+        decodePumpScheduled = true
+        renderQueue.asyncAfter(deadline: .now() + 0.05) { [weak self] in
+            guard let self else { return }
+            self.decodePumpScheduled = false
+            self.pumpDecode()
+        }
+    }
+
+    private func clearPendingVideo() {
+        pendingVideo.removeAll()
+        pendingVideoHead = 0
+        pendingVideoBytes = 0
     }
 
     /// While paused the drain blocks may stop firing (the display layer is full),
@@ -324,7 +386,8 @@ final class TStreamSampleBufferPlayer: NSObject {
     private func scheduleResumeCheck() {
         renderQueue.asyncAfter(deadline: .now() + 0.25) { [weak self] in
             guard let self, self.sourcePaused, !self.stopped else { return }
-            if self.bufferedAheadSeconds() <= self.lowWaterSeconds {
+            if self.bufferedAheadSeconds() <= self.lowWaterSeconds,
+               self.pendingVideoBytes <= self.maxPendingVideoBytes * 3 / 4 {
                 self.sourcePaused = false
                 self.source.resume()
             } else {
@@ -453,6 +516,14 @@ extension TStreamSampleBufferPlayer: MediaSourceDelegate {
 
     private func ingestRawVideo(_ data: Data, codec: VideoCodec, pts: UInt64, dts: UInt64) {
         guard !stopped, !discardingUntilSeek else { return }
+        pendingVideo.append(PendingVideo(data: data, codec: codec, pts: pts, dts: dts))
+        pendingVideoBytes += data.count
+        pumpDecode()
+        updateBackpressure()
+    }
+
+    private func decodeVideo(_ packet: PendingVideo) {
+        let (data, codec, pts, dts) = (packet.data, packet.codec, packet.pts, packet.dts)
         if ffDecoder == nil {
             ffDecoder = TStreamFFVideoDecoder(codec: codec,
                                               packetized: videoIsPacketized,
