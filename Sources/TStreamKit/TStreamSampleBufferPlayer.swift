@@ -22,10 +22,19 @@ final class TStreamSampleBufferPlayer: NSObject {
     /// Reports elapsed playback seconds (relative to the first frame) ~4×/sec
     /// once the clock is running. Delivered on the main thread.
     var onProgress: ((TimeInterval) -> Void)?
+    /// State of the live buffer, reported twice a second on the main thread
+    /// while timeshift is enabled. Runs off its own timer rather than the
+    /// playback clock, so the delay keeps growing visibly while paused.
+    var onTimeshiftStatus: ((TStreamTimeshiftStatus) -> Void)?
 
     private let synchronizer = AVSampleBufferRenderSynchronizer()
     private let audioRenderer = AVSampleBufferAudioRenderer()
     private let source: MediaSource
+    /// The same object as `source` when the live buffer is enabled, kept
+    /// separately for the rewind controls. Nil for recordings and for live
+    /// playback without timeshift.
+    private let timeshift: TimeshiftMediaSource?
+    private var statusTimer: DispatchSourceTimer?
     /// Serializes video decode + display drain + all playback state.
     private let renderQueue = DispatchQueue(label: "com.tstream.render")
     /// Serializes the audio drain so refilling the audio renderer is never
@@ -141,18 +150,32 @@ final class TStreamSampleBufferPlayer: NSObject {
 
     convenience init(url: URL,
                      headers: [String: String] = [:],
-                     credential: URLCredential? = nil) {
+                     credential: URLCredential? = nil,
+                     timeshift: TStreamTimeshiftConfiguration? = nil) {
         // A downloaded recording is played straight off disk; `URLSession`
-        // can't fetch `file:` URLs.
+        // can't fetch `file:` URLs, and a local file needs no timeshift buffer
+        // because it is already seekable end to end.
         guard !url.isFileURL else {
-            self.init(source: FileMediaSource(url: url))
+            self.init(source: FileMediaSource(url: url), timeshift: nil)
             return
         }
-        self.init(source: HTTPMediaSource(url: url, headers: headers, credential: credential))
+        let http = HTTPMediaSource(url: url, headers: headers, credential: credential)
+        if let timeshift {
+            let wrapper = TimeshiftMediaSource(
+                wrapping: http,
+                configuration: TimeshiftBuffer.Configuration(
+                    maximumDuration: timeshift.maximumDuration,
+                    maximumBytes: timeshift.maximumBytes,
+                    directory: timeshift.storageDirectory))
+            self.init(source: wrapper, timeshift: wrapper)
+        } else {
+            self.init(source: http, timeshift: nil)
+        }
     }
 
-    init(source: MediaSource) {
+    init(source: MediaSource, timeshift: TimeshiftMediaSource? = nil) {
         self.source = source
+        self.timeshift = timeshift
         super.init()
 
         synchronizer.addRenderer(audioRenderer)
@@ -160,9 +183,20 @@ final class TStreamSampleBufferPlayer: NSObject {
 
         source.delegate = self
         source.onError = { [weak self] error in self?.report(error) }
+        // Losing the ring mid-replay leaves the player minutes behind the
+        // packets now arriving, so flush and pick the live stream back up.
+        timeshift?.onBufferingEnded = { [weak self] in
+            self?.renderQueue.async {
+                guard let self, !self.stopped else { return }
+                self.flushForSeek()
+                self.endSeekDiscard()
+            }
+        }
+        if timeshift != nil { startStatusTimer() }
     }
 
     deinit {
+        statusTimer?.cancel()
         if let progressObserver { synchronizer.removeTimeObserver(progressObserver) }
         displayLayer.stopRequestingMediaData()
         audioRenderer.stopRequestingMediaData()
@@ -184,6 +218,9 @@ final class TStreamSampleBufferPlayer: NSObject {
             // If the clock hasn't started yet, `startClockIfReady` will honour
             // `userPaused` and bring it up at rate 0 (first frame shown, frozen).
             if self.clockStarted { self.synchronizer.rate = 0 }
+            // With a live buffer, a pause is a timeshift: recording carries on
+            // and resuming picks up exactly where the picture froze.
+            self.timeshift?.beginHold()
         }
     }
 
@@ -194,6 +231,7 @@ final class TStreamSampleBufferPlayer: NSObject {
         renderQueue.async {
             guard self.userPaused, !self.stopped else { return }
             self.userPaused = false
+            self.timeshift?.endHold()
             guard self.clockStarted else { return }
             self.synchronizer.rate = 1
             self.armVideo()
@@ -215,6 +253,73 @@ final class TStreamSampleBufferPlayer: NSObject {
                 self?.renderQueue.async { self?.endSeekDiscard() }
             }
         }
+    }
+
+    // MARK: - Timeshift (live rewind)
+
+    /// Whether the live buffer is usable right now.
+    var isTimeshiftAvailable: Bool { timeshift?.isAvailable ?? false }
+
+    /// Skip within the live buffer, relative to the current position. Negative
+    /// values rewind. Playback restarts at the nearest keyframe at or before
+    /// the target, the same accuracy a recording seek gives.
+    func timeshiftSkip(by seconds: TimeInterval) {
+        renderQueue.async {
+            guard !self.stopped, let timeshift = self.timeshift, timeshift.isAvailable else { return }
+            let current = self.clockStarted
+                ? self.synchronizer.currentTime()
+                : (self.firstPTS ?? .zero)
+            let target = CMTimeGetSeconds(current) + seconds
+            guard target > 0 else { return }
+            self.flushForSeek()
+            timeshift.seek(toTimestamp: UInt64(target * 90_000)) { [weak self] in
+                self?.renderQueue.async { self?.endSeekDiscard() }
+            }
+        }
+    }
+
+    /// Drop everything buffered ahead of the broadcast and rejoin it live.
+    func timeshiftReturnToLive() {
+        renderQueue.async {
+            guard !self.stopped, let timeshift = self.timeshift, timeshift.isAvailable else { return }
+            self.flushForSeek()
+            timeshift.returnToLive { [weak self] in
+                self?.renderQueue.async { self?.endSeekDiscard() }
+            }
+        }
+    }
+
+    /// Reports the buffer state on its own timer instead of the playback clock,
+    /// which stops ticking exactly when the numbers matter most — while paused,
+    /// as the delay behind live grows.
+    private func startStatusTimer() {
+        let timer = DispatchSource.makeTimerSource(queue: renderQueue)
+        timer.schedule(deadline: .now() + 0.5, repeating: 0.5)
+        timer.setEventHandler { [weak self] in self?.reportTimeshiftStatus() }
+        statusTimer = timer
+        timer.resume()
+    }
+
+    /// On `renderQueue`.
+    private func reportTimeshiftStatus() {
+        guard let onTimeshiftStatus else { return }
+        guard !stopped, let timeshift, timeshift.isAvailable, let span = timeshift.bufferedSpan else {
+            DispatchQueue.main.async { onTimeshiftStatus(.unavailable) }
+            return
+        }
+        let current = clockStarted ? synchronizer.currentTime() : (firstPTS ?? .zero)
+        let position = CMTimeGetSeconds(current)
+        let earliest = Double(span.earliest) / 90_000
+        let latest = Double(span.latest) / 90_000
+        let live = timeshift.isPlayingLive
+        let status = TStreamTimeshiftStatus(
+            isAvailable: true,
+            // Playing live means the couple of seconds of decode buffer are not
+            // a delay the viewer should be told about.
+            delaySeconds: live ? 0 : max(0, latest - position),
+            rewindableSeconds: max(0, position - earliest),
+            isAtLiveEdge: live)
+        DispatchQueue.main.async { onTimeshiftStatus(status) }
     }
 
     /// Tear down all decode/render state for the current position so the seeked
@@ -243,6 +348,8 @@ final class TStreamSampleBufferPlayer: NSObject {
     }
 
     func stop() {
+        statusTimer?.cancel()
+        statusTimer = nil
         renderQueue.async {
             guard !self.stopped else { return }
             self.stopped = true

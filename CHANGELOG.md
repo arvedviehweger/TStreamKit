@@ -7,6 +7,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- Pausing and rewinding **live** streams. With a `TStreamTimeshiftConfiguration`
+  attached, compressed access units are recorded to a ring on disk while they
+  play, so a pause keeps recording and resuming continues from the frozen frame
+  instead of jumping forward. `TStreamPlayerHandle.skipTimeshift(by:)` rewinds
+  into what has already aired and `returnToLive()` rejoins the broadcast;
+  replay is paced at real time and catches back up on its own.
+  `.onTimeshiftStatus` reports how far behind live playback is and how much
+  further back it can go. The ring holds compressed units rather than decoded
+  frames, so an hour of HD costs about a gigabyte of disk and almost no memory
+  — and if it can't be created, or a write fails, the stream keeps playing
+  without it.
 - Playback of local files: a `file:` URL is read off disk instead of over HTTP,
   through the same container detection and demuxers. A file always has a length,
   so a downloaded recording scrubs like a streamed one.

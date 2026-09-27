@@ -38,6 +38,7 @@ handle.
   - [SwiftUI](#swiftui)
   - [View modifiers](#view-modifiers)
   - [Seeking & progress (recordings)](#seeking--progress-recordings)
+  - [Pausing & rewinding live TV](#pausing--rewinding-live-tv)
   - [UIKit](#uikit)
   - [AppKit](#appkit)
   - [Diagnostics](#diagnostics)
@@ -153,6 +154,8 @@ fire on the **main thread**.
 | `.onProgress { seconds }`      | Elapsed seconds since the first frame, ~4×/second while playing.        |
 | `.paused(_ value: Bool)`       | Freeze (`true`) / resume (`false`) video **and** audio.                 |
 | `.handle(_ handle:)`           | Attach a `TStreamPlayerHandle` for imperative seeking (see below).      |
+| `.timeshift(_ configuration:)` | Record the live stream to a disk ring so it can be paused and rewound.  |
+| `.onTimeshiftStatus { status }`| Buffer state twice a second: delay behind live, how far back you can go.|
 
 ```swift
 struct PlayerScreen: View {
@@ -208,12 +211,59 @@ struct RecordingPlayer: View {
 
 > Live streams have no end, so `seek(toFraction:)` is a no-op until the source
 > reports a total byte count. `onProgress` reports an **absolute** offset that
-> stays correct across seeks.
+> stays correct across seeks. To rewind a *live* stream, see
+> [Pausing & rewinding live TV](#pausing--rewinding-live-tv).
 
 A **local file** works the same way: pass a `file:` URL and TStreamKit reads it
 off disk instead of over HTTP, through the same detection and demuxers. A file
 always has a length, so a downloaded recording scrubs exactly like a streamed
 one.
+
+### Pausing & rewinding live TV
+
+Attach a `TStreamTimeshiftConfiguration` and TStreamKit records every compressed
+access unit to a ring on disk as it plays. Pausing then keeps recording, so
+resuming continues from the frozen frame instead of jumping forward, and
+`skipTimeshift(by:)` rewinds into what has already aired. Replay is paced at
+real time and rejoins the broadcast on its own once it catches up.
+
+The ring holds *compressed* units, so an hour of HD broadcast is roughly a
+gigabyte of disk and almost no memory. It lives in the caches directory and is
+deleted when playback stops. If it can't be created — no space, an I/O error —
+the stream still plays and only the rewinding goes away, which
+`TStreamTimeshiftStatus.isAvailable` reports.
+
+```swift
+struct LivePlayer: View {
+    let url: URL
+    @State private var handle = TStreamPlayerHandle()
+    @State private var isPaused = false
+    @State private var status = TStreamTimeshiftStatus.unavailable
+
+    var body: some View {
+        VStack {
+            TStreamPlayerView(url: url)
+                .handle(handle)
+                .paused(isPaused)
+                .timeshift(TStreamTimeshiftConfiguration(maximumDuration: 3600))
+                .onTimeshiftStatus { status = $0 }
+                .aspectRatio(16/9, contentMode: .fit)
+
+            HStack {
+                Button("−30s") { handle.skipTimeshift(by: -30) }
+                Button(isPaused ? "Resume" : "Pause") { isPaused.toggle() }
+                if !status.isAtLiveEdge {
+                    Button("Live") { handle.returnToLive() }
+                }
+            }
+        }
+    }
+}
+```
+
+> Rewinding lands on the nearest keyframe at or before the target — the same
+> accuracy `seek(toFraction:)` gives. Seeking further back than the buffer
+> reaches clamps to its oldest restart point.
 
 ### UIKit
 

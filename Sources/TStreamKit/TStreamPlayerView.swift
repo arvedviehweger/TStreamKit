@@ -31,6 +31,18 @@ public final class TStreamPlayerHandle {
     public func seek(toFraction fraction: Double) {
         player?.seek(toFraction: fraction)
     }
+
+    /// Skip inside the live buffer, relative to the current position; negative
+    /// values rewind. Does nothing unless the view was given a
+    /// `TStreamTimeshiftConfiguration`.
+    public func skipTimeshift(by seconds: TimeInterval) {
+        player?.timeshiftSkip(by: seconds)
+    }
+
+    /// Abandon the buffered position and rejoin the broadcast live.
+    public func returnToLive() {
+        player?.timeshiftReturnToLive()
+    }
 }
 
 public struct TStreamPlayerView: View {
@@ -44,6 +56,8 @@ public struct TStreamPlayerView: View {
     private var onReady: (() -> Void)?
     private var onAudioOnly: (() -> Void)?
     private var onProgress: ((TimeInterval) -> Void)?
+    private var timeshiftConfiguration: TStreamTimeshiftConfiguration?
+    private var onTimeshiftStatus: ((TStreamTimeshiftStatus) -> Void)?
 
     public init(url: URL, headers: [String: String] = [:], autoPlay: Bool = true) {
         self.url = url
@@ -110,11 +124,30 @@ public struct TStreamPlayerView: View {
         return copy
     }
 
+    /// Records the live stream to a disk ring so it can be paused and rewound.
+    /// Only meaningful for a live source; a recording is already seekable.
+    public func timeshift(_ configuration: TStreamTimeshiftConfiguration) -> TStreamPlayerView {
+        var copy = self
+        copy.timeshiftConfiguration = configuration
+        return copy
+    }
+
+    /// Reports the live buffer's state on the main thread, twice a second.
+    public func onTimeshiftStatus(
+        _ handler: @escaping (TStreamTimeshiftStatus) -> Void
+    ) -> TStreamPlayerView {
+        var copy = self
+        copy.onTimeshiftStatus = handler
+        return copy
+    }
+
     public var body: some View {
         _TStreamPlayerContainer(url: url, headers: headers, credential: credential,
                                 autoPlay: autoPlay,
                                 isPaused: isPaused, handle: handle, onError: onError,
-                                onReady: onReady, onAudioOnly: onAudioOnly, onProgress: onProgress)
+                                onReady: onReady, onAudioOnly: onAudioOnly, onProgress: onProgress,
+                                timeshiftConfiguration: timeshiftConfiguration,
+                                onTimeshiftStatus: onTimeshiftStatus)
     }
 }
 
@@ -131,6 +164,8 @@ private struct _TStreamPlayerContainer: View {
     let onReady: (() -> Void)?
     let onAudioOnly: (() -> Void)?
     let onProgress: ((TimeInterval) -> Void)?
+    let timeshiftConfiguration: TStreamTimeshiftConfiguration?
+    let onTimeshiftStatus: ((TStreamTimeshiftStatus) -> Void)?
 
     @StateObject private var model = PlayerModel()
 
@@ -145,7 +180,9 @@ private struct _TStreamPlayerContainer: View {
             model.configure(url: url, headers: headers, credential: credential,
                             autoPlay: autoPlay,
                             onError: onError, onReady: onReady, onAudioOnly: onAudioOnly,
-                            onProgress: onProgress)
+                            onProgress: onProgress,
+                            timeshift: timeshiftConfiguration,
+                            onTimeshiftStatus: onTimeshiftStatus)
             handle?.player = model.player
             model.setPaused(isPaused)
         }
@@ -165,13 +202,17 @@ private final class PlayerModel: ObservableObject {
                    autoPlay: Bool,
                    onError: ((TStreamError) -> Void)?, onReady: (() -> Void)?,
                    onAudioOnly: (() -> Void)?,
-                   onProgress: ((TimeInterval) -> Void)?) {
+                   onProgress: ((TimeInterval) -> Void)?,
+                   timeshift: TStreamTimeshiftConfiguration?,
+                   onTimeshiftStatus: ((TStreamTimeshiftStatus) -> Void)?) {
         guard player == nil else { return }
-        let player = TStreamSampleBufferPlayer(url: url, headers: headers, credential: credential)
+        let player = TStreamSampleBufferPlayer(url: url, headers: headers,
+                                               credential: credential, timeshift: timeshift)
         player.onError = onError
         player.onReadyToPlay = onReady
         player.onAudioOnly = onAudioOnly
         player.onProgress = onProgress
+        player.onTimeshiftStatus = onTimeshiftStatus
         self.player = player
         if autoPlay { player.play() }
     }
