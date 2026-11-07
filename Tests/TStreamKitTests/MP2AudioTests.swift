@@ -30,3 +30,83 @@ final class MP2AudioTests: XCTestCase {
         XCTAssertEqual([UInt8](MP2Transcoder.audioSpecificConfig(sampleRate: 44100, channels: 2)), [0x12, 0x10])
     }
 }
+
+final class MP2TranscoderTimelineTests: XCTestCase {
+    /// 384-byte frames, each 1152 samples = 2160 ticks at 48 kHz.
+    private let frameBytes = 384
+    private let frameTicks: UInt64 = 2160
+    private let start: UInt64 = 900_000
+
+    private func frames() throws -> [[UInt8]] {
+        let url = try XCTUnwrap(Bundle.module.url(forResource: "Fixtures/probe", withExtension: "mp2"))
+        let bytes = try [UInt8](Data(contentsOf: url))
+        return stride(from: 0, to: bytes.count - frameBytes + 1, by: frameBytes).map {
+            Array(bytes[$0..<($0 + frameBytes)])
+        }
+    }
+
+    /// Feeds `frames` as PES of `perPES` frames each, stamped with the stream
+    /// time of their first frame, leaving out the PES numbered in `dropping`.
+    private func transcode(_ frames: [[UInt8]], perPES: Int, dropping: Set<Int> = [],
+                           split: Bool = false) -> [UInt64] {
+        let transcoder = MP2Transcoder()
+        var stamps: [UInt64] = []
+        transcoder.onAAC = { _, pts in stamps.append(pts) }
+        // `split` cuts each PES half a frame early, carrying the rest over, the
+        // way a PES boundary can fall mid-frame.
+        var bytes: [UInt8] = []
+        for f in frames { bytes += f }
+        var offset = 0
+        var index = 0
+        while offset < bytes.count {
+            let firstFrame = index * perPES
+            var end = min(offset + perPES * frameBytes, bytes.count)
+            if split, end < bytes.count { end -= frameBytes / 2 }
+            // A PES is stamped with the first frame *starting* in it.
+            let firstStart = (offset + frameBytes - 1) / frameBytes
+            let pts = start + UInt64(split ? firstStart : firstFrame) * frameTicks
+            if !dropping.contains(index) { transcoder.consume(Array(bytes[offset..<end]), pts: pts) }
+            offset = end
+            index += 1
+        }
+        return stamps
+    }
+
+    func testCleanStreamIsContinuous() throws {
+        let stamps = transcode(try frames(), perPES: 2)
+        XCTAssertGreaterThan(stamps.count, 80)
+        XCTAssertEqual(stamps.first, start)
+        for (a, b) in zip(stamps, stamps.dropFirst()) { XCTAssertEqual(b - a, 1920) }
+    }
+
+    /// A PES lost to a continuity gap must leave a gap of the same length —
+    /// otherwise every later packet plays early, and the frame cut off at the
+    /// loss gets glued to the next PES and decodes as noise.
+    func testLostPESIsBridgedOnTheStreamClock() throws {
+        let all = try frames()
+        let clean = transcode(all, perPES: 2, split: true)
+        let lossy = transcode(all, perPES: 2, dropping: [10], split: true)
+        // Still one continuous run of packets…
+        for (a, b) in zip(lossy, lossy.dropFirst()) { XCTAssertEqual(b - a, 1920) }
+        // …that covers the same stretch of stream time as the clean one.
+        let cleanEnd = try XCTUnwrap(clean.last), lossyEnd = try XCTUnwrap(lossy.last)
+        XCTAssertLessThanOrEqual(abs(Int64(cleanEnd) - Int64(lossyEnd)), 1920)
+    }
+
+    func testJumpRestartsTheTimeline() throws {
+        let all = try frames()
+        let transcoder = MP2Transcoder()
+        var stamps: [UInt64] = []
+        transcoder.onAAC = { _, pts in stamps.append(pts) }
+        for (i, pair) in stride(from: 0, to: 40, by: 2).enumerated() {
+            transcoder.consume(all[pair] + all[pair + 1], pts: start + UInt64(i) * 2 * frameTicks)
+        }
+        let before = stamps.count
+        let later: UInt64 = 90_000 * 60
+        for (i, pair) in stride(from: 40, to: 80, by: 2).enumerated() {
+            transcoder.consume(all[pair] + all[pair + 1], pts: later + UInt64(i) * 2 * frameTicks)
+        }
+        let after = Array(stamps[before...])
+        XCTAssertEqual(after.first, later)
+    }
+}

@@ -27,8 +27,18 @@ final class MP2Transcoder {
     private var residual: [UInt8] = []
     /// 90 kHz presentation time of the first decoded sample.
     private var basePTS: UInt64?
+    /// PCM sample frames queued for encode since `basePTS` — decoded audio
+    /// plus any silence laid in for lost frames. Where the next frame lands.
+    private var inputSampleCount: UInt64 = 0
     /// AAC sample frames emitted so far (for drift-free output timestamps).
     private var outputSampleCount: UInt64 = 0
+
+    /// Half a frame: anything closer to the projection is rounding (and the
+    /// odd tick broadcast encoders add), anything further is lost audio.
+    private static let toleranceTicks: Int64 = 90_000 * 576 / 48_000
+    /// Up to this much lost audio is bridged with silence, keeping the encoder
+    /// and the timeline running; past it, or backwards, the timeline restarts.
+    private static let maxBridgedTicks: Int64 = 90_000
 
     // Scratch shared with the AudioConverter input callback during a drain.
     private var inputBase: UnsafePointer<Int16>?
@@ -45,6 +55,10 @@ final class MP2Transcoder {
     /// Consumes the MP2 elementary bytes from one PES (with that PES's PTS),
     /// decoding every complete frame and encoding the result to AAC.
     func consume(_ elementary: [UInt8], pts: UInt64) {
+        // A PES without a PTS (flags 00) reads as 0 and carries no timing.
+        if pts != 0 { align(to: pts) }
+
+        let carriedBytes = residual.count
         var data = residual
         data.append(contentsOf: elementary)
         residual = []
@@ -53,29 +67,89 @@ final class MP2Transcoder {
         while true {
             guard let sync = MPEGAudio.nextSync(data, from: i) else { break }
             guard let header = MPEGAudio.parseHeader(data, sync) else { i = sync + 1; continue }
-            guard sync + header.frameLength <= data.count else {
+            let end = sync + header.frameLength
+            guard end <= data.count else {
                 // Incomplete trailing frame — keep it for the next PES.
                 residual = Array(data[sync...])
                 break
             }
-            if basePTS == nil { basePTS = pts }
+            // A real frame is followed by another one. A false sync inside a
+            // damaged frame claims a length that runs into the middle of the
+            // next one; decoding it would swallow good frames and play noise.
+            if end + 4 <= data.count, MPEGAudio.parseHeader(data, end) == nil {
+                i = sync + 1
+                continue
+            }
+            if basePTS == nil {
+                // A frame carried over from the previous PES starts one frame
+                // before the time this PES is stamped with.
+                let carriedTicks = sync < carriedBytes ? UInt64(1152 * 90_000 / header.sampleRate) : 0
+                basePTS = pts &- carriedTicks
+            }
             setupIfNeeded(sampleRate: header.sampleRate)
-            decode(Array(data[sync..<(sync + header.frameLength)]))
-            i = sync + header.frameLength
+            decode(Array(data[sync..<end]))
+            i = end
         }
         drain()
+    }
+
+    /// Forgets everything about the current stream (after a seek): the next
+    /// PES starts a new timeline. The output format stays, as it is the same
+    /// stream.
+    func reset() {
+        residual = []
+        pcmQueue = []
+        basePTS = nil
+        inputSampleCount = 0
+        outputSampleCount = 0
+        if let converter { AudioConverterReset(converter) }
+    }
+
+    /// Checks the PES's PTS against where the audio decoded so far says it
+    /// should be. The demuxer throws away a PES damaged by a continuity gap,
+    /// so lost frames show up here as a jump: they are replaced by silence,
+    /// which keeps the audio on the stream's clock — counting samples alone
+    /// would leave it early by every frame ever lost, and glue the dropped
+    /// PES's neighbours together into a noise burst.
+    private func align(to pts: UInt64) {
+        guard let base = basePTS, sampleRate > 0 else { return }
+        let rate = UInt64(sampleRate)
+        // The PTS belongs to the first frame that *starts* in this PES, so a
+        // frame carried over from the previous one comes before it.
+        let carried: UInt64 = residual.isEmpty ? 0 : 1152
+        let projected = base &+ (inputSampleCount + carried) * 90_000 / rate
+        let delta = Int64(bitPattern: pts &- projected)
+        if abs(delta) <= Self.toleranceTicks { return }
+
+        // The carried bytes were cut off by the loss; the rest of that frame
+        // never arrives.
+        residual = []
+        let gap = Int64(bitPattern: pts &- (base &+ inputSampleCount * 90_000 / rate))
+        if gap > 0, gap <= Self.maxBridgedTicks {
+            let frames = Int((gap * Int64(rate) + 45_000) / 90_000)
+            pcmQueue.append(contentsOf: repeatElement(0, count: frames * outChannels))
+            inputSampleCount += UInt64(frames)
+            TStreamDiagnostics.log("mp2: \(frames) samples lost, bridged with silence")
+        } else {
+            TStreamDiagnostics.log("mp2: timeline jumped \(gap) ticks, restarting")
+            reset()
+        }
     }
 
     // MARK: - Decode
 
     private func decode(_ frame: [UInt8]) {
         var pcm = [Int16](repeating: 0, count: 1152 * 2) // always stereo
-        frame.withUnsafeBufferPointer { fb in
+        let consumed = frame.withUnsafeBufferPointer { fb in
             pcm.withUnsafeMutableBufferPointer { pb in
-                _ = kjmp2_decode_frame(decoder, fb.baseAddress, pb.baseAddress)
+                kjmp2_decode_frame(decoder, fb.baseAddress, pb.baseAddress)
             }
         }
+        // A frame kjmp2 turns down still takes up its time: queue it as
+        // silence, so what follows stays where it belongs.
+        if consumed == 0 { pcm = [Int16](repeating: 0, count: 1152 * 2) }
         pcmQueue.append(contentsOf: pcm)
+        inputSampleCount += 1152
     }
 
     // MARK: - Encode
@@ -147,7 +221,8 @@ final class MP2Transcoder {
                     converter, Self.inputProc,
                     Unmanaged.passUnretained(self).toOpaque(),
                     &ioPackets, &abl, nil)
-                guard status == noErr, ioPackets == 1 else { break }
+                // `needMoreInput` just means the queue ran dry mid-packet.
+                guard status == noErr || status == Self.needMoreInput, ioPackets == 1 else { break }
 
                 let size = Int(abl.mBuffers.mDataByteSize)
                 guard size > 0 else { break }
@@ -175,8 +250,10 @@ final class MP2Transcoder {
         let framesLeft = me.inputFrameTotal - me.inputCursor
         let n = min(framesLeft, Int(ioNumberDataPackets.pointee))
         guard n > 0, let base = me.inputBase else {
+            // Zero packets with `noErr` tells the encoder the stream has
+            // ended, and it would flush. Out of input for now is not that.
             ioNumberDataPackets.pointee = 0
-            return noErr
+            return needMoreInput
         }
         let ptr = UnsafeMutableRawPointer(mutating: base.advanced(by: me.inputCursor * me.outChannels))
         ioData.pointee.mNumberBuffers = 1
@@ -187,6 +264,10 @@ final class MP2Transcoder {
         ioNumberDataPackets.pointee = UInt32(n)
         return noErr
     }
+
+    /// Returned by the input proc when the queue is empty but the stream
+    /// goes on.
+    private static let needMoreInput: OSStatus = 0x6E6D6421 // 'nmd!'
 
     // MARK: - Helpers
 

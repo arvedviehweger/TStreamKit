@@ -58,3 +58,12 @@ ffmpeg -f lavfi -i testsrc=size=128x96:rate=25:duration=1 \
        -f lavfi -i "sine=frequency=440:duration=1" \
        -c:v libvpx -b:v 100k -ac 2 -c:a libopus -b:a 32k probe-opus.webm
 ```
+
+`probe.mp2` is two seconds of 48 kHz stereo MPEG-1 Layer II at 128 kbit/s (384
+bytes per frame), the audio of SD DVB channels, used to check the MP2 → AAC
+transcoder's timeline when PES are lost:
+
+```sh
+ffmpeg -f lavfi -i "sine=frequency=440:sample_rate=48000:duration=2" \
+       -ac 2 -c:a mp2 -b:a 128k -f mp2 probe.mp2
+```

@@ -151,6 +151,7 @@ final class TSDemuxer {
         // The route the audio takes belongs to the stream and survives a seek;
         // the timeline it is laid on does not, and the next block re-anchors it.
         pcmTimeline.reset()
+        mp2Transcoder.reset()
     }
 
     func consume(_ packet: TSPacket) {
