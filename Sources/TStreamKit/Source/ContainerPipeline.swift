@@ -54,6 +54,7 @@ final class ContainerPipeline {
     }
 
     func reset() { demuxer?.reset() }
+    func selectAudioTrack(id: Int) { demuxer?.selectAudioTrack(id: id) }
     func finish() { demuxer?.finish() }
 
     func stop() {

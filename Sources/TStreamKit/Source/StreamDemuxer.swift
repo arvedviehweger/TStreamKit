@@ -16,10 +16,13 @@ protocol StreamDemuxer: AnyObject {
     func finish()
     /// Release resources. Nothing is emitted afterwards.
     func stop()
+    /// Switch to another sound track. Containers that offer no choice ignore it.
+    func selectAudioTrack(id: Int)
 }
 
 extension StreamDemuxer {
     func stop() {}
+    func selectAudioTrack(id: Int) {}
 }
 
 /// Shape of a single pixel, as a container describes it. Only carried for codecs
@@ -59,6 +62,13 @@ protocol StreamDemuxerOutput: AnyObject {
     func demuxerDidParseAudioFormat(_ format: AudioFormat)
     func demuxerDidProduceAudio(_ unit: AccessUnit)
     func demuxerDidFail(_ error: TStreamError)
+    /// The sound tracks on offer, and which one is playing. A container that
+    /// never reports any simply has nothing to choose between.
+    func demuxerDidUpdateAudioTracks(_ tracks: [TStreamAudioTrack], selected: Int?)
+}
+
+extension StreamDemuxerOutput {
+    func demuxerDidUpdateAudioTracks(_ tracks: [TStreamAudioTrack], selected: Int?) {}
 }
 
 /// MPEG-TS via the hand-written parser and demuxer. This is the tuned path for
@@ -89,6 +99,10 @@ final class TSStreamDemuxer: StreamDemuxer {
         demuxer.reset()
     }
 
+    func selectAudioTrack(id: Int) {
+        demuxer.selectAudioTrack(id: id)
+    }
+
     func finish() {
         demuxer.flush()
     }
@@ -113,5 +127,8 @@ extension TSStreamDemuxer: TSDemuxerDelegate {
     }
     func demuxer(_ d: TSDemuxer, didFail error: TStreamError) {
         output?.demuxerDidFail(error)
+    }
+    func demuxer(_ d: TSDemuxer, didUpdateAudioTracks tracks: [TStreamAudioTrack], selected: Int?) {
+        output?.demuxerDidUpdateAudioTracks(tracks, selected: selected)
     }
 }

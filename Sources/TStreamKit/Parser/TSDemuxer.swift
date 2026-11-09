@@ -66,6 +66,9 @@ protocol TSDemuxerDelegate: AnyObject {
     func demuxer(_ demuxer: TSDemuxer, didFail error: TStreamError)
     /// Called once the PMT is parsed, reporting which elementary streams exist.
     func demuxer(_ demuxer: TSDemuxer, didIdentifyStreamsHasVideo hasVideo: Bool, hasAudio: Bool)
+    /// Every sound track the programme offers, and which one is being demuxed.
+    func demuxer(_ demuxer: TSDemuxer, didUpdateAudioTracks tracks: [TStreamAudioTrack],
+                 selected: Int?)
     /// Raw-mode only: the unprocessed (Annex-B) video PES payload, for decoders
     /// (libavcodec) that do their own NAL/field/frame assembly. `isKeyframe`
     /// marks a random-access point — nothing on the decode path needs it, but
@@ -79,6 +82,8 @@ protocol TSDemuxerDelegate: AnyObject {
 // muxing consumer never sees raw video.
 extension TSDemuxerDelegate {
     func demuxer(_ demuxer: TSDemuxer, didIdentifyStreamsHasVideo hasVideo: Bool, hasAudio: Bool) {}
+    func demuxer(_ demuxer: TSDemuxer, didUpdateAudioTracks tracks: [TStreamAudioTrack],
+                 selected: Int?) {}
     func demuxer(_ demuxer: TSDemuxer, didProduceRawVideo data: Data, codec: VideoCodec,
                  pts: UInt64, dts: UInt64, isKeyframe: Bool) {}
     func demuxer(_ demuxer: TSDemuxer, didParseVideoFormat format: VideoFormat) {}
@@ -136,6 +141,16 @@ final class TSDemuxer {
     private var videoPES = PESAccumulator()
     private var audioPES = PESAccumulator()
 
+    /// Every audio elementary stream the PMT listed, with what is needed to
+    /// switch to it. The PMT is parsed once, so this is the whole menu.
+    private struct AudioStream {
+        let pid: UInt16
+        let codec: AudioCodec
+        let latm: Bool
+        let track: TStreamAudioTrack
+    }
+    private var audioStreams: [AudioStream] = []
+
     func reset() {
         pmtPID = nil; videoPID = nil; audioPID = nil
         videoCodec = nil; audioCodec = nil; audioLATM = false
@@ -148,6 +163,7 @@ final class TSDemuxer {
         pendingField = nil
         videoPES = PESAccumulator()
         audioPES = PESAccumulator()
+        audioStreams.removeAll()
         // The route the audio takes belongs to the stream and survives a seek;
         // the timeline it is laid on does not, and the next block re-anchors it.
         pcmTimeline.reset()
@@ -236,18 +252,96 @@ final class TSDemuxer {
                 }
             }
 
-            if let candidate = Self.classifyAudio(streamType: streamType, descriptors: descriptors),
-               candidate.rank > audioRank {
-                audioPID = elementaryPID
-                audioCodec = candidate.codec
-                audioLATM = candidate.latm
-                audioRank = candidate.rank
+            if let candidate = Self.classifyAudio(streamType: streamType, descriptors: descriptors) {
+                let language = Self.audioLanguage(descriptors)
+                audioStreams.append(AudioStream(
+                    pid: elementaryPID,
+                    codec: candidate.codec,
+                    latm: candidate.latm,
+                    track: TStreamAudioTrack(
+                        id: Int(elementaryPID),
+                        language: language?.code,
+                        codecName: Self.codecName(candidate.codec),
+                        kind: Self.trackKind(audioType: language?.type))))
+
+                // The automatic pick stays what it was — Dolby over stereo —
+                // and is only ever a starting point now.
+                if candidate.rank > audioRank {
+                    audioPID = elementaryPID
+                    audioCodec = candidate.codec
+                    audioLATM = candidate.latm
+                    audioRank = candidate.rank
+                }
             }
 
             i = descStart + esInfoLength
         }
 
         delegate?.demuxer(self, didIdentifyStreamsHasVideo: videoPID != nil, hasAudio: audioPID != nil)
+        delegate?.demuxer(self, didUpdateAudioTracks: audioStreams.map(\.track),
+                          selected: audioPID.map(Int.init))
+    }
+
+    /// Switches which sound track is demuxed. Everything decoded from the old
+    /// one is dropped: a half-finished PES of AC-3 is not the start of an AAC
+    /// one, and the format has to be announced again for the new codec.
+    func selectAudioTrack(id: Int) {
+        guard let stream = audioStreams.first(where: { Int($0.pid) == id }),
+              stream.pid != audioPID else { return }
+
+        if let previous = audioPID { lastContinuity[previous] = nil }
+        audioPID = stream.pid
+        audioCodec = stream.codec
+        audioLATM = stream.latm
+
+        audioPES = PESAccumulator()
+        didEmitAudioFormat = false
+        latmParser.reset()
+        mp2Transcoder.reset()
+
+        TStreamDiagnostics.log("demux: audio track -> pid \(stream.pid)")
+        delegate?.demuxer(self, didUpdateAudioTracks: audioStreams.map(\.track), selected: id)
+    }
+
+    /// ISO 639 language descriptor (tag `0x0A`): a 3-character language code
+    /// followed by the audio type that says what the track is for.
+    private static func audioLanguage(_ descriptors: ArraySlice<UInt8>) -> (code: String, type: UInt8)? {
+        let d = Array(descriptors)
+        var j = 0
+        while j + 2 <= d.count {
+            let tag = d[j]
+            let len = Int(d[j + 1])
+            let body = j + 2
+            guard body + len <= d.count else { break }
+            if tag == 0x0A, len >= 4 {
+                let code = String(bytes: d[body..<(body + 3)], encoding: .ascii)?
+                    .trimmingCharacters(in: .whitespaces)
+                if let code, !code.isEmpty {
+                    return (code, d[body + 3])
+                }
+            }
+            j = body + len
+        }
+        return nil
+    }
+
+    private static func trackKind(audioType: UInt8?) -> TStreamAudioTrack.Kind {
+        switch audioType {
+        case 0x01: return .cleanEffects
+        case 0x02: return .hearingImpaired
+        case 0x03: return .audioDescription
+        default: return .normal
+        }
+    }
+
+    private static func codecName(_ codec: AudioCodec) -> String {
+        switch codec {
+        case .aac:  return "AAC"
+        case .ac3:  return "Dolby Digital"
+        case .eac3: return "Dolby Digital Plus"
+        case .mp2:  return "MPEG Audio"
+        case .pcm:  return "PCM"
+        }
     }
 
     /// Classifies a PMT elementary stream as an audio candidate with a selection

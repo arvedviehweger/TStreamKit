@@ -31,6 +31,13 @@ protocol MediaSource: AnyObject {
     /// libavformat). `completion` fires on the source's queue once the new read
     /// position is live, so the player can discard stale pre-seek data.
     func seek(toFraction fraction: Double, completion: @escaping () -> Void)
+
+    /// Switch to another sound track, identified by `TStreamAudioTrack.id`.
+    func selectAudioTrack(id: Int)
+}
+
+extension MediaSource {
+    func selectAudioTrack(id: Int) {}
 }
 
 /// Output of a `MediaSource`. Timestamps are 90 kHz for every source — a
@@ -54,4 +61,7 @@ protocol MediaSourceDelegate: AnyObject {
     func mediaSource(_ source: MediaSource, didParseAudioFormat format: AudioFormat)
     func mediaSource(_ source: MediaSource, didProduceAudio unit: AccessUnit)
     func mediaSource(_ source: MediaSource, didFail error: TStreamError)
+    /// The sound tracks on offer, and which one is playing.
+    func mediaSource(_ source: MediaSource, didUpdateAudioTracks tracks: [TStreamAudioTrack],
+                     selected: Int?)
 }

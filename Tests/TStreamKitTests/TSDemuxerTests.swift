@@ -11,6 +11,8 @@ final class DemuxerSpy: TSDemuxerDelegate {
     var errors: [TStreamError] = []
     var rawVideo: [(codec: VideoCodec, pts: UInt64)] = []
     var rawVideoKeyframes: [Bool] = []
+    var audioTracks: [TStreamAudioTrack] = []
+    var selectedAudioTrack: Int?
 
     func demuxer(_ d: TSDemuxer, didParseVideoFormat format: VideoFormat) { videoFormat = format }
     func demuxer(_ d: TSDemuxer, didParseAudioFormat format: AudioFormat) { audioFormat = format }
@@ -22,6 +24,10 @@ final class DemuxerSpy: TSDemuxerDelegate {
         rawVideoKeyframes.append(isKeyframe)
     }
     func demuxer(_ d: TSDemuxer, didFail error: TStreamError) { errors.append(error) }
+    func demuxer(_ d: TSDemuxer, didUpdateAudioTracks tracks: [TStreamAudioTrack], selected: Int?) {
+        audioTracks = tracks
+        selectedAudioTrack = selected
+    }
     func demuxer(_ d: TSDemuxer, didIdentifyStreamsHasVideo v: Bool, hasAudio a: Bool) {
         hasVideo = v; hasAudio = a
     }
@@ -331,5 +337,80 @@ final class TSDemuxerTests: XCTestCase {
         XCTAssertTrue(spy.videoUnits.first?.isKeyframe ?? false)
         XCTAssertGreaterThanOrEqual(spy.audioUnits.count, 1)
         XCTAssertTrue(spy.errors.isEmpty)
+    }
+}
+
+// MARK: - Audio track selection
+
+extension TSDemuxerTests {
+    /// German broadcasts routinely carry the dub beside the original and an
+    /// audio description track. All of them have to be offered, with the
+    /// language the broadcaster declared.
+    func testEnumeratesEveryAudioTrackWithItsLanguage() {
+        let spy = DemuxerSpy()
+        let demuxer = TSDemuxer()
+        demuxer.delegate = spy
+
+        // ISO 639 language descriptor: tag 0x0A, length 4, 3 chars + audio type.
+        let german: [UInt8] = [0x0A, 0x04, 0x64, 0x65, 0x75, 0x00]     // "deu", normal
+        let english: [UInt8] = [0x0A, 0x04, 0x65, 0x6E, 0x67, 0x00]    // "eng", normal
+        let described: [UInt8] = [0x0A, 0x04, 0x64, 0x65, 0x75, 0x03]  // "deu", audio description
+
+        let parser = TSPacketParser()
+        var stream: [UInt8] = []
+        stream += TS.packet(pid: 0x0000, payloadUnitStart: true, payload: TS.pat(pmtPID: 0x1000))
+        stream += TS.packet(pid: 0x1000, payloadUnitStart: true, payload: TS.pmt(
+            videoPID: 0x0100,
+            audio: [(0x81, 0x0101, german),      // AC-3
+                    (0x03, 0x0102, english),     // MPEG audio
+                    (0x03, 0x0103, described)]))
+        for packet in parser.push(Data(stream)) { demuxer.consume(packet) }
+
+        XCTAssertEqual(spy.audioTracks.map(\.id), [0x0101, 0x0102, 0x0103])
+        XCTAssertEqual(spy.audioTracks.map(\.language), ["deu", "eng", "deu"])
+        XCTAssertEqual(spy.audioTracks.map(\.kind), [.normal, .normal, .audioDescription])
+        // Dolby still wins the automatic pick, as it did before any of this.
+        XCTAssertEqual(spy.selectedAudioTrack, 0x0101)
+    }
+
+    /// Switching has to actually change which PID is demuxed — and report it,
+    /// so the UI's tick moves with it.
+    func testSelectingAnAudioTrackSwitchesThePID() {
+        let spy = DemuxerSpy()
+        let demuxer = TSDemuxer()
+        demuxer.delegate = spy
+
+        let parser = TSPacketParser()
+        var stream: [UInt8] = []
+        stream += TS.packet(pid: 0x0000, payloadUnitStart: true, payload: TS.pat(pmtPID: 0x1000))
+        stream += TS.packet(pid: 0x1000, payloadUnitStart: true, payload: TS.pmt(
+            videoPID: 0x0100,
+            audio: [(0x81, 0x0101, [0x0A, 0x04, 0x64, 0x65, 0x75, 0x00]),
+                    (0x0F, 0x0102, [0x0A, 0x04, 0x65, 0x6E, 0x67, 0x00])]))
+        for packet in parser.push(Data(stream)) { demuxer.consume(packet) }
+        XCTAssertEqual(spy.selectedAudioTrack, 0x0101)
+
+        demuxer.selectAudioTrack(id: 0x0102)
+
+        XCTAssertEqual(spy.selectedAudioTrack, 0x0102)
+        XCTAssertEqual(spy.audioTracks.count, 2, "the menu itself does not change")
+    }
+
+    /// An id from a different stream must not silently change anything.
+    func testSelectingAnUnknownTrackIsIgnored() {
+        let spy = DemuxerSpy()
+        let demuxer = TSDemuxer()
+        demuxer.delegate = spy
+
+        let parser = TSPacketParser()
+        var stream: [UInt8] = []
+        stream += TS.packet(pid: 0x0000, payloadUnitStart: true, payload: TS.pat(pmtPID: 0x1000))
+        stream += TS.packet(pid: 0x1000, payloadUnitStart: true, payload: TS.pmt(
+            videoPID: 0x0100, audio: [(0x81, 0x0101, [])]))
+        for packet in parser.push(Data(stream)) { demuxer.consume(packet) }
+
+        demuxer.selectAudioTrack(id: 0x0999)
+
+        XCTAssertEqual(spy.selectedAudioTrack, 0x0101)
     }
 }

@@ -76,8 +76,13 @@ final class TimeshiftMediaSource: MediaSource {
     /// Oldest and newest recorded timestamp, in 90 kHz ticks.
     var bufferedSpan: (earliest: UInt64, latest: UInt64)? { buffer?.span }
 
+    /// Kept so the ring can be rebuilt — switching sound tracks invalidates
+    /// everything in it.
+    private let configuration: TimeshiftBuffer.Configuration
+
     init(wrapping inner: MediaSource, configuration: TimeshiftBuffer.Configuration) {
         self.inner = inner
+        self.configuration = configuration
         self.buffer = TimeshiftBuffer(configuration: configuration)
         inner.delegate = self
         inner.onError = { [weak self] error in self?.onError?(error) }
@@ -133,6 +138,24 @@ final class TimeshiftMediaSource: MediaSource {
 
     func seek(toFraction fraction: Double, completion: @escaping () -> Void) {
         queue.async(execute: completion)
+    }
+
+    /// Switching sound tracks invalidates what is buffered: those units are
+    /// the old codec, and replaying them under the new format description would
+    /// be noise. The ring starts over, so the viewer trades their rewind window
+    /// for the language they asked for.
+    func selectAudioTrack(id: Int) {
+        inner.selectAudioTrack(id: id)
+        queue.async {
+            guard !self.stopped, self.buffer != nil else { return }
+            self.buffer?.tearDown()
+            self.buffer = TimeshiftBuffer(configuration: self.configuration)
+            self.setAvailable(self.buffer != nil)
+            self.cursor = self.buffer?.endIndex ?? 0
+            self.clearAnchor()
+            self.setMode(.live)
+            self.inner.resume()
+        }
     }
 
     // MARK: - Timeshift control
@@ -359,6 +382,13 @@ extension TimeshiftMediaSource: MediaSourceDelegate {
     func mediaSource(_ source: MediaSource, didFail error: TStreamError) {
         queue.async {
             self.delegate?.mediaSource(self, didFail: error)
+        }
+    }
+
+    func mediaSource(_ source: MediaSource, didUpdateAudioTracks tracks: [TStreamAudioTrack],
+                     selected: Int?) {
+        queue.async {
+            self.delegate?.mediaSource(self, didUpdateAudioTracks: tracks, selected: selected)
         }
     }
 

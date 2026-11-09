@@ -210,6 +210,8 @@ private final class TimeshiftSpy: MediaSourceDelegate {
         lock.lock(); _audio.append((unit.pts, unit.data.first ?? 0)); lock.unlock()
     }
     func mediaSource(_ source: MediaSource, didFail error: TStreamError) {}
+    func mediaSource(_ source: MediaSource, didUpdateAudioTracks tracks: [TStreamAudioTrack],
+                     selected: Int?) {}
 }
 
 final class TimeshiftMediaSourceTests: XCTestCase {

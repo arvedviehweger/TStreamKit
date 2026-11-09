@@ -95,6 +95,10 @@ final class FileMediaSource: MediaSource {
         }
     }
 
+    func selectAudioTrack(id: Int) {
+        queue.async { self.pipeline.selectAudioTrack(id: id) }
+    }
+
     // MARK: - Reading
 
     /// On `queue`. Hops back through the queue between chunks so pause, seek
@@ -151,6 +155,9 @@ extension FileMediaSource: StreamDemuxerOutput {
     }
     func demuxerDidProduceAudio(_ unit: AccessUnit) {
         delegate?.mediaSource(self, didProduceAudio: unit)
+    }
+    func demuxerDidUpdateAudioTracks(_ tracks: [TStreamAudioTrack], selected: Int?) {
+        delegate?.mediaSource(self, didUpdateAudioTracks: tracks, selected: selected)
     }
     func demuxerDidFail(_ error: TStreamError) {
         fail(error)

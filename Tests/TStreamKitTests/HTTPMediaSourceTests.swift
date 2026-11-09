@@ -56,6 +56,8 @@ final class MediaSourceSpy: MediaSourceDelegate {
     var audioOnly = false
     var audio: [AccessUnit] = []
     var errors: [TStreamError] = []
+    var audioTracks: [TStreamAudioTrack] = []
+    var selectedAudioTrack: Int?
     let received = XCTestExpectation(description: "source produced output")
 
     func mediaSource(_ s: MediaSource, didParseVideoFormat codec: VideoCodec, extradata: Data?,
@@ -78,6 +80,11 @@ final class MediaSourceSpy: MediaSourceDelegate {
     }
     func mediaSource(_ s: MediaSource, didProduceAudio unit: AccessUnit) {
         audio.append(unit)
+    }
+    func mediaSource(_ s: MediaSource, didUpdateAudioTracks tracks: [TStreamAudioTrack],
+                     selected: Int?) {
+        audioTracks = tracks
+        selectedAudioTrack = selected
     }
     func mediaSource(_ s: MediaSource, didFail error: TStreamError) {
         errors.append(error)

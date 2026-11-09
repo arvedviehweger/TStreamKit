@@ -19,6 +19,9 @@ final class TStreamSampleBufferPlayer: NSObject {
     /// as soon as the source says so, which is before playback starts, so a host
     /// can put something on screen instead of leaving the display layer black.
     var onAudioOnly: (() -> Void)?
+    /// The sound tracks the stream offers and which one is playing, on the main
+    /// thread. Sent once the programme map is parsed, and again after a switch.
+    var onAudioTracks: (([TStreamAudioTrack], Int?) -> Void)?
     /// Reports elapsed playback seconds (relative to the first frame) ~4×/sec
     /// once the clock is running. Delivered on the main thread.
     var onProgress: ((TimeInterval) -> Void)?
@@ -104,6 +107,35 @@ final class TStreamSampleBufferPlayer: NSObject {
     /// clock, so the audio has to do both itself. On `renderQueue`; the
     /// audio-queue mirror is `audioDrivesClock`.
     private var audioOnly = false
+
+    /// What the host asked for: video off because the app is in the background.
+    /// Separate from `videoSuspended` because Picture in Picture overrides it —
+    /// there the app is backgrounded but the picture is still on screen.
+    private var videoSuspendRequested = false
+    /// Whether video is actually off right now. On `renderQueue`.
+    private var videoSuspended = false
+    /// Set while the picture is showing in the Picture in Picture window, which
+    /// is the one case where a backgrounded app must keep decoding.
+    private var pictureInPictureActive = false
+
+    /// `userPaused`, readable from the main thread. Picture in Picture asks for
+    /// the play/pause state from its own delegate callbacks, and `userPaused`
+    /// belongs to `renderQueue`.
+    private let pausedLock = NSLock()
+    private var pausedMirror = false
+    var isPausedByUser: Bool {
+        pausedLock.lock(); defer { pausedLock.unlock() }
+        return pausedMirror
+    }
+
+    private func setPausedMirror(_ value: Bool) {
+        pausedLock.lock(); pausedMirror = value; pausedLock.unlock()
+        onPlaybackStateChange?()
+    }
+
+    /// Fired when the paused state changes, so Picture in Picture can refresh
+    /// the button it draws. Called on `renderQueue`.
+    var onPlaybackStateChange: (() -> Void)?
 
     // Whether each renderer currently has an active media-data request. We arm
     // it only while there is data to drain and stop when empty — otherwise the
@@ -215,6 +247,7 @@ final class TStreamSampleBufferPlayer: NSObject {
         renderQueue.async {
             guard !self.userPaused, !self.stopped else { return }
             self.userPaused = true
+            self.setPausedMirror(true)
             // If the clock hasn't started yet, `startClockIfReady` will honour
             // `userPaused` and bring it up at rate 0 (first frame shown, frozen).
             if self.clockStarted { self.synchronizer.rate = 0 }
@@ -231,12 +264,101 @@ final class TStreamSampleBufferPlayer: NSObject {
         renderQueue.async {
             guard self.userPaused, !self.stopped else { return }
             self.userPaused = false
+            self.setPausedMirror(false)
             self.timeshift?.endHold()
             guard self.clockStarted else { return }
             self.synchronizer.rate = 1
             self.armVideo()
             self.audioRenderQueue.async { self.armAudio() }
             self.scheduleResumeCheck()
+        }
+    }
+
+    // MARK: - Audio tracks
+
+    /// Switch to another sound track.
+    ///
+    /// Everything already queued is the previous codec, so the renderer is
+    /// flushed and its format description dropped — the demuxer announces the
+    /// new one as soon as it has parsed a frame of it. The clock keeps running
+    /// off the video throughout, so the picture never stops; the sound returns
+    /// within a frame or two.
+    func selectAudioTrack(id: Int) {
+        source.selectAudioTrack(id: id)
+        audioRenderQueue.async { [weak self] in
+            guard let self, !self.audioStopped else { return }
+            self.audioRenderer.stopRequestingMediaData()
+            self.audioRequesting = false
+            self.audioRenderer.flush()
+            self.audioQueue.removeAll()
+            self.audioFormatDesc = nil
+        }
+    }
+
+    // MARK: - Background audio
+
+    /// Turn video off (or back on) while audio keeps playing — what an app needs
+    /// when it goes to the background holding the `audio` background mode.
+    ///
+    /// The picture cannot be rendered with the screen off anyway, and the
+    /// display layer stops asking for data there, which would stall the drain,
+    /// back the source up and starve the audio. So video is dropped at ingest
+    /// instead and the audio timeline takes over the clock — the same path a
+    /// radio channel already uses.
+    ///
+    /// Ignored while Picture in Picture is up: that is a backgrounded app whose
+    /// picture is still on screen.
+    func setVideoSuspended(_ suspended: Bool) {
+        renderQueue.async { [weak self] in
+            guard let self, !self.stopped, self.videoSuspendRequested != suspended else { return }
+            self.videoSuspendRequested = suspended
+            self.applyVideoSuspension()
+        }
+    }
+
+    /// On `renderQueue`.
+    func setPictureInPictureActive(_ active: Bool) {
+        renderQueue.async { [weak self] in
+            guard let self, !self.stopped, self.pictureInPictureActive != active else { return }
+            self.pictureInPictureActive = active
+            self.applyVideoSuspension()
+        }
+    }
+
+    /// On `renderQueue`.
+    private func applyVideoSuspension() {
+        let suspend = videoSuspendRequested && !pictureInPictureActive
+        guard suspend != videoSuspended else { return }
+        videoSuspended = suspend
+
+        if suspend {
+            displayLayer.stopRequestingMediaData()
+            videoRequesting = false
+            displayLayer.flush()
+            // Decoded frames for a screen that is off are pure memory, and the
+            // packets waiting behind them are worthless too: coming back needs
+            // a keyframe regardless, and holding them would trip the pending
+            // byte budget and suspend the source the audio is feeding from.
+            videoQueue.removeAll()
+            clearPendingVideo()
+            ffDecoder = nil
+            setAudioDrivesClock(true)
+            TStreamDiagnostics.log("sbplayer: video suspended, audio carries the clock")
+        } else {
+            // A radio channel's audio never stops driving the clock.
+            if !audioOnly { setAudioDrivesClock(false) }
+            armVideo()
+            // The source may have been parked by the audio-measured
+            // backpressure; the video path needs it running again.
+            scheduleResumeCheck()
+            TStreamDiagnostics.log("sbplayer: video resumed")
+        }
+    }
+
+    private func setAudioDrivesClock(_ value: Bool) {
+        audioRenderQueue.async { [weak self] in
+            guard let self, !self.audioStopped else { return }
+            self.audioDrivesClock = value
         }
     }
 
@@ -628,10 +750,15 @@ extension TStreamSampleBufferPlayer: MediaSourceDelegate {
         report(error)
     }
 
+    func mediaSource(_ s: MediaSource, didUpdateAudioTracks tracks: [TStreamAudioTrack],
+                     selected: Int?) {
+        DispatchQueue.main.async { [weak self] in self?.onAudioTracks?(tracks, selected) }
+    }
+
     // MARK: ingest (video on renderQueue, audio on audioRenderQueue)
 
     private func ingestRawVideo(_ data: Data, codec: VideoCodec, pts: UInt64, dts: UInt64) {
-        guard !stopped, !discardingUntilSeek else { return }
+        guard !stopped, !discardingUntilSeek, !videoSuspended else { return }
         pendingVideo.append(PendingVideo(data: data, codec: codec, pts: pts, dts: dts))
         pendingVideoBytes += data.count
         pumpDecode()

@@ -57,6 +57,10 @@ final class HTTPMediaSource: MediaSource {
         stream.seek(toByteOffset: Int64(Double(total) * clamped), completion: completion)
     }
 
+    func selectAudioTrack(id: Int) {
+        queue.async { self.pipeline.selectAudioTrack(id: id) }
+    }
+
     /// On `queue`.
     private func ingest(_ data: Data) {
         guard !stopped, !failed else { return }
@@ -90,6 +94,9 @@ extension HTTPMediaSource: StreamDemuxerOutput {
     }
     func demuxerDidProduceAudio(_ unit: AccessUnit) {
         delegate?.mediaSource(self, didProduceAudio: unit)
+    }
+    func demuxerDidUpdateAudioTracks(_ tracks: [TStreamAudioTrack], selected: Int?) {
+        delegate?.mediaSource(self, didUpdateAudioTracks: tracks, selected: selected)
     }
     func demuxerDidFail(_ error: TStreamError) {
         fail(error)

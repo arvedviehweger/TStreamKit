@@ -6,6 +6,44 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+- A black Picture in Picture window appeared on backgrounding after the player
+  had been closed. Three things kept it coming: the player handle held the
+  controller strongly and outlived the teardown, so a controller still armed
+  for automatic start survived the layer it drew from; stopping the window did
+  not disarm that automatic start or release the content source; and the
+  automatic start was armed before anything was known about the stream, so a
+  radio channel — or one that never produced a frame — floated an empty window
+  too. The handle's reference is now weak, teardown invalidates the controller
+  outright, and the automatic start is only armed once a first frame has
+  played and the stream is known to carry video.
+
+### Added
+- Sound-track selection. The MPEG-TS demuxer now reports every audio stream the
+  programme map lists rather than only the one it picked, with the language and
+  audio type from the ISO 639 descriptor — so audio description and
+  hard-of-hearing mixes can be labelled as such instead of appearing as a
+  second anonymous "German". `onAudioTracks` reports the menu,
+  `selectAudioTrack(id:)` switches, and the automatic pick (Dolby over stereo)
+  is unchanged as the starting point. Switching flushes the audio renderer and
+  waits for the new format; the picture never stops, because the clock runs off
+  the video throughout. Containers demuxed by libavformat report no tracks,
+  which reads as "nothing to choose".
+- Background audio: `videoSuspended(_:)` turns the picture off while the sound
+  keeps playing, for a host that holds the `audio` background mode. The display
+  layer stops asking for frames once the screen is off, which used to stall the
+  pipeline, back the source up and cut the audio with it; video is now dropped
+  at ingest instead and the audio timeline takes over the clock and the
+  backpressure measurement — the same path a radio channel already used.
+- Picture in Picture, through `AVPictureInPictureController`'s sample-buffer
+  content source, so the existing display layer becomes the window's content
+  without an `AVPlayer` anywhere. `pictureInPicture(_:automatically:)` enables
+  it, the handle starts and stops it, `onPictureInPictureChange` reports the
+  window, and `onSkipRequest` hands its skip buttons to the host — only the
+  host knows whether to rewind a live stream or seek in a recording. Video is
+  never suspended while the window is up.
+
+
 ### Added
 - Pausing and rewinding **live** streams. With a `TStreamTimeshiftConfiguration`
   attached, compressed access units are recorded to a ring on disk while they

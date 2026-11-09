@@ -43,6 +43,35 @@ public final class TStreamPlayerHandle {
     public func returnToLive() {
         player?.timeshiftReturnToLive()
     }
+
+    /// Switch to another sound track, by `TStreamAudioTrack.id`.
+    public func selectAudioTrack(id: Int) {
+        player?.selectAudioTrack(id: id)
+    }
+
+    // MARK: - Picture in Picture
+
+    #if os(iOS) || os(macOS)
+    /// Whether this device can float the picture over other apps at all. False
+    /// on hardware without Picture in Picture, and while Low Power Mode has it
+    /// switched off.
+    public var isPictureInPictureSupported: Bool { TStreamPictureInPicture.isSupported }
+
+    /// Open the Picture in Picture window. Needs `.pictureInPicture(true)` on
+    /// the view, and the `audio` background mode in the app's Info.plist.
+    public func startPictureInPicture() { pictureInPicture?.start() }
+
+    /// Close it and bring the picture back inline.
+    public func stopPictureInPicture() { pictureInPicture?.stop() }
+
+    public var isPictureInPictureActive: Bool { pictureInPicture?.isActive ?? false }
+
+    /// Weak on purpose. The handle is `@State` in the host view and outlives
+    /// the player's teardown; holding this strongly kept a controller alive
+    /// that was still armed to open a window, and it opened a black one over
+    /// the layer the closed player had flushed.
+    weak var pictureInPicture: TStreamPictureInPicture?
+    #endif
 }
 
 public struct TStreamPlayerView: View {
@@ -55,9 +84,15 @@ public struct TStreamPlayerView: View {
     private var onError: ((TStreamError) -> Void)?
     private var onReady: (() -> Void)?
     private var onAudioOnly: (() -> Void)?
+    private var onAudioTracks: (([TStreamAudioTrack], Int?) -> Void)?
     private var onProgress: ((TimeInterval) -> Void)?
     private var timeshiftConfiguration: TStreamTimeshiftConfiguration?
     private var onTimeshiftStatus: ((TStreamTimeshiftStatus) -> Void)?
+    private var isVideoSuspended = false
+    private var pictureInPictureEnabled = false
+    private var startsPictureInPictureAutomatically = true
+    private var onPictureInPictureChange: ((Bool) -> Void)?
+    private var onSkipRequest: ((TimeInterval) -> Void)?
 
     public init(url: URL, headers: [String: String] = [:], autoPlay: Bool = true) {
         self.url = url
@@ -111,6 +146,17 @@ public struct TStreamPlayerView: View {
         return copy
     }
 
+    /// Reports the sound tracks the stream offers and which one is playing, on
+    /// the main thread. A stream with one track reports one; a container that
+    /// offers no choice reports none.
+    public func onAudioTracks(
+        _ handler: @escaping ([TStreamAudioTrack], Int?) -> Void
+    ) -> TStreamPlayerView {
+        var copy = self
+        copy.onAudioTracks = handler
+        return copy
+    }
+
     /// Credentials for an HTTP auth challenge.
     ///
     /// An `Authorization` header passed to `init` covers Basic and saves a round
@@ -141,13 +187,63 @@ public struct TStreamPlayerView: View {
         return copy
     }
 
+    /// Turn video off while audio keeps playing — set this when the app leaves
+    /// the foreground and it holds the `audio` background mode.
+    ///
+    /// The picture can't be drawn with the screen off anyway, and the display
+    /// layer stops asking for frames there, which would stall the pipeline and
+    /// cut the sound. Ignored while the Picture in Picture window is up.
+    public func videoSuspended(_ suspended: Bool) -> TStreamPlayerView {
+        var copy = self
+        copy.isVideoSuspended = suspended
+        return copy
+    }
+
+    /// Allow the picture to float over other apps.
+    ///
+    /// `automatically` lets the system open the window when the app is
+    /// backgrounded; turn it off to open it only from `startPictureInPicture()`.
+    public func pictureInPicture(_ enabled: Bool,
+                                 automatically: Bool = true) -> TStreamPlayerView {
+        var copy = self
+        copy.pictureInPictureEnabled = enabled
+        copy.startsPictureInPictureAutomatically = automatically
+        return copy
+    }
+
+    /// Reports the Picture in Picture window opening and closing.
+    public func onPictureInPictureChange(
+        _ handler: @escaping (Bool) -> Void
+    ) -> TStreamPlayerView {
+        var copy = self
+        copy.onPictureInPictureChange = handler
+        return copy
+    }
+
+    /// Handles the skip buttons in the Picture in Picture window. Left to the
+    /// host because only it knows whether this is a live stream to rewind or a
+    /// recording to seek within.
+    public func onSkipRequest(
+        _ handler: @escaping (TimeInterval) -> Void
+    ) -> TStreamPlayerView {
+        var copy = self
+        copy.onSkipRequest = handler
+        return copy
+    }
+
     public var body: some View {
         _TStreamPlayerContainer(url: url, headers: headers, credential: credential,
                                 autoPlay: autoPlay,
                                 isPaused: isPaused, handle: handle, onError: onError,
-                                onReady: onReady, onAudioOnly: onAudioOnly, onProgress: onProgress,
+                                onReady: onReady, onAudioOnly: onAudioOnly,
+                                onAudioTracks: onAudioTracks, onProgress: onProgress,
                                 timeshiftConfiguration: timeshiftConfiguration,
-                                onTimeshiftStatus: onTimeshiftStatus)
+                                onTimeshiftStatus: onTimeshiftStatus,
+                                isVideoSuspended: isVideoSuspended,
+                                pictureInPictureEnabled: pictureInPictureEnabled,
+                                startsPictureInPictureAutomatically: startsPictureInPictureAutomatically,
+                                onPictureInPictureChange: onPictureInPictureChange,
+                                onSkipRequest: onSkipRequest)
     }
 }
 
@@ -163,9 +259,15 @@ private struct _TStreamPlayerContainer: View {
     let onError: ((TStreamError) -> Void)?
     let onReady: (() -> Void)?
     let onAudioOnly: (() -> Void)?
+    let onAudioTracks: (([TStreamAudioTrack], Int?) -> Void)?
     let onProgress: ((TimeInterval) -> Void)?
     let timeshiftConfiguration: TStreamTimeshiftConfiguration?
     let onTimeshiftStatus: ((TStreamTimeshiftStatus) -> Void)?
+    let isVideoSuspended: Bool
+    let pictureInPictureEnabled: Bool
+    let startsPictureInPictureAutomatically: Bool
+    let onPictureInPictureChange: ((Bool) -> Void)?
+    let onSkipRequest: ((TimeInterval) -> Void)?
 
     @StateObject private var model = PlayerModel()
 
@@ -180,14 +282,27 @@ private struct _TStreamPlayerContainer: View {
             model.configure(url: url, headers: headers, credential: credential,
                             autoPlay: autoPlay,
                             onError: onError, onReady: onReady, onAudioOnly: onAudioOnly,
+                            onAudioTracks: onAudioTracks,
                             onProgress: onProgress,
                             timeshift: timeshiftConfiguration,
                             onTimeshiftStatus: onTimeshiftStatus)
             handle?.player = model.player
             model.setPaused(isPaused)
+            #if os(iOS) || os(macOS)
+            if pictureInPictureEnabled {
+                model.enablePictureInPicture(automatically: startsPictureInPictureAutomatically,
+                                             onChange: onPictureInPictureChange,
+                                             onSkip: onSkipRequest)
+                handle?.pictureInPicture = model.pictureInPicture
+            }
+            #endif
+            model.setVideoSuspended(isVideoSuspended)
         }
         .onChange(of: isPaused) { paused in
             model.setPaused(paused)
+        }
+        .onChange(of: isVideoSuspended) { suspended in
+            model.setVideoSuspended(suspended)
         }
         .onDisappear {
             model.teardown()
@@ -202,6 +317,7 @@ private final class PlayerModel: ObservableObject {
                    autoPlay: Bool,
                    onError: ((TStreamError) -> Void)?, onReady: (() -> Void)?,
                    onAudioOnly: (() -> Void)?,
+                   onAudioTracks: (([TStreamAudioTrack], Int?) -> Void)?,
                    onProgress: ((TimeInterval) -> Void)?,
                    timeshift: TStreamTimeshiftConfiguration?,
                    onTimeshiftStatus: ((TStreamTimeshiftStatus) -> Void)?) {
@@ -209,8 +325,22 @@ private final class PlayerModel: ObservableObject {
         let player = TStreamSampleBufferPlayer(url: url, headers: headers,
                                                credential: credential, timeshift: timeshift)
         player.onError = onError
-        player.onReadyToPlay = onReady
-        player.onAudioOnly = onAudioOnly
+        player.onReadyToPlay = { [weak self] in
+            #if os(iOS) || os(macOS)
+            self?.armAutomaticPictureInPicture()
+            #endif
+            onReady?()
+        }
+        // A radio channel would otherwise float a black window the moment the
+        // app is backgrounded: the automatic start is armed before anyone knows
+        // whether the stream carries video.
+        player.onAudioOnly = { [weak self] in
+            #if os(iOS) || os(macOS)
+            self?.pictureInPicture?.setAutomatic(false)
+            #endif
+            onAudioOnly?()
+        }
+        player.onAudioTracks = onAudioTracks
         player.onProgress = onProgress
         player.onTimeshiftStatus = onTimeshiftStatus
         self.player = player
@@ -221,7 +351,44 @@ private final class PlayerModel: ObservableObject {
         if paused { player?.pause() } else { player?.resume() }
     }
 
+    func setVideoSuspended(_ suspended: Bool) {
+        player?.setVideoSuspended(suspended)
+    }
+
+    #if os(iOS) || os(macOS)
+    private(set) var pictureInPicture: TStreamPictureInPicture?
+
+    /// Whether the host asked for the window to open by itself. Held rather
+    /// than applied straight away — see `armAutomaticPictureInPicture`.
+    private var wantsAutomaticPictureInPicture = false
+
+    func enablePictureInPicture(automatically: Bool,
+                                onChange: ((Bool) -> Void)?,
+                                onSkip: ((TimeInterval) -> Void)?) {
+        guard pictureInPicture == nil, let player else { return }
+        let pip = TStreamPictureInPicture(player: player, layer: player.displayLayer)
+        pip.onStateChange = onChange
+        pip.onSkip = onSkip
+        // Deliberately not armed yet: a stream that never produces a frame —
+        // one that fails, or that the viewer closes while it is still starting
+        // — would otherwise float an empty window as soon as the app is
+        // backgrounded. Arming waits for the first frame.
+        pip.setAutomatic(false)
+        wantsAutomaticPictureInPicture = automatically
+        pictureInPicture = pip
+    }
+
+    private func armAutomaticPictureInPicture() {
+        guard wantsAutomaticPictureInPicture else { return }
+        pictureInPicture?.setAutomatic(true)
+    }
+    #endif
+
     func teardown() {
+        #if os(iOS) || os(macOS)
+        pictureInPicture?.invalidate()
+        pictureInPicture = nil
+        #endif
         player?.stop()
         player = nil
     }
