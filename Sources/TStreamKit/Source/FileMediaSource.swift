@@ -42,8 +42,13 @@ final class FileMediaSource: MediaSource {
                 return
             }
             self.handle = handle
-            let size = (try? FileManager.default.attributesOfItem(atPath: self.url.path)[.size]) as? NSNumber
-            self.totalBytes = size?.int64Value ?? 0
+            // `resourceValues(forKeys:)` rather than `attributesOfItem`: that
+            // one goes through `stat` and hands back the file's timestamps
+            // along with its size, which brings it within reach of Apple's
+            // required-reason API rules for nothing — only the size is wanted,
+            // and `.fileSizeKey` asks for exactly that.
+            let size = try? self.url.resourceValues(forKeys: [.fileSizeKey]).fileSize
+            self.totalBytes = Int64(size ?? 0)
             TStreamDiagnostics.log("file: playing \(self.url.lastPathComponent), \(self.totalBytes) bytes")
             self.scheduleRead()
         }
