@@ -293,9 +293,9 @@ extension HTTPByteStream: URLSessionDataDelegate {
     }
 
     func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
-        queue.async {
+        queue.async { [weak self] in
             // Ignore completion of a task we've already replaced (seek/cancel).
-            guard !self.stopped, task == self.dataTask else { return }
+            guard let self, !self.stopped, task == self.dataTask else { return }
             if let error, (error as NSError).code != NSURLErrorCancelled {
                 TStreamDiagnostics.log(
                     "source: request \(self.attempt) ended after \(self.receivedBytes) bytes")

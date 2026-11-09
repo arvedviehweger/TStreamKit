@@ -246,8 +246,8 @@ final class TStreamSampleBufferPlayer: NSObject {
     /// correct because it is anchored to `streamStartPTS`, not the per-segment
     /// `firstPTS`. A live stream isn't seekable and this does nothing.
     func seek(toFraction fraction: Double) {
-        renderQueue.async {
-            guard !self.stopped, self.source.isSeekable else { return }
+        renderQueue.async { [weak self] in
+            guard let self, !self.stopped, self.source.isSeekable else { return }
             self.flushForSeek()
             self.source.seek(toFraction: fraction) { [weak self] in
                 self?.renderQueue.async { self?.endSeekDiscard() }
@@ -264,8 +264,8 @@ final class TStreamSampleBufferPlayer: NSObject {
     /// values rewind. Playback restarts at the nearest keyframe at or before
     /// the target, the same accuracy a recording seek gives.
     func timeshiftSkip(by seconds: TimeInterval) {
-        renderQueue.async {
-            guard !self.stopped, let timeshift = self.timeshift, timeshift.isAvailable else { return }
+        renderQueue.async { [weak self] in
+            guard let self, !self.stopped, let timeshift = self.timeshift, timeshift.isAvailable else { return }
             let current = self.clockStarted
                 ? self.synchronizer.currentTime()
                 : (self.firstPTS ?? .zero)
@@ -280,8 +280,8 @@ final class TStreamSampleBufferPlayer: NSObject {
 
     /// Drop everything buffered ahead of the broadcast and rejoin it live.
     func timeshiftReturnToLive() {
-        renderQueue.async {
-            guard !self.stopped, let timeshift = self.timeshift, timeshift.isAvailable else { return }
+        renderQueue.async { [weak self] in
+            guard let self, !self.stopped, let timeshift = self.timeshift, timeshift.isAvailable else { return }
             self.flushForSeek()
             timeshift.returnToLive { [weak self] in
                 self?.renderQueue.async { self?.endSeekDiscard() }
