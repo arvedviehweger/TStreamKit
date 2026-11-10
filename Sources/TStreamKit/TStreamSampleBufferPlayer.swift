@@ -102,6 +102,17 @@ final class TStreamSampleBufferPlayer: NSObject {
     private var firstPTS: CMTime?
     private var latestPTS: CMTime = .zero
     private let prerollSeconds = 1.0
+    /// How much *received* video a container stream must have before the clock
+    /// starts. tvheadend's transcoding profiles (Matroska, WebM, MP4) send their
+    /// output in bursts: measured on a VP8 WebM channel, the bytes stop for up
+    /// to 2.3 s between clusters while the content itself is a steady 25 fps.
+    /// One second of lead ran dry in every such gap and the picture stuttered.
+    /// MPEG-TS arrives evenly and keeps the short start. The extra lead waits
+    /// compressed in `pendingVideo`, so it costs no decoded-frame memory.
+    private let containerPrerollSeconds = 3.0
+    /// First and newest PTS handed over by the source, before decoding. 90 kHz.
+    private var firstReceivedPTS: UInt64?
+    private var latestReceivedPTS: UInt64 = 0
     /// Set when the source reports the stream carries no video — a radio
     /// channel. Nothing will ever arrive to open the audio gate or anchor the
     /// clock, so the audio has to do both itself. On `renderQueue`; the
@@ -464,6 +475,8 @@ final class TStreamSampleBufferPlayer: NSObject {
         clockStarted = false
         firstPTS = nil
         latestPTS = .zero
+        firstReceivedPTS = nil
+        latestReceivedPTS = 0
         sawVideo = false
         sourcePaused = false
         discardingUntilSeek = true
@@ -642,6 +655,11 @@ final class TStreamSampleBufferPlayer: NSObject {
     private func startClockIfReady() {
         guard !stopped, !clockStarted, let firstPTS else { return }
         guard CMTimeGetSeconds(latestPTS - firstPTS) >= prerollSeconds else { return }
+        if videoIsPacketized, !audioOnly {
+            guard let firstReceivedPTS,
+                  Double(latestReceivedPTS &- firstReceivedPTS) / 90_000 >= containerPrerollSeconds
+            else { return }
+        }
         clockStarted = true
         // Honour a pause requested during buffering: bring the clock up frozen
         // (the first frame is presented) instead of auto-playing.
@@ -686,11 +704,7 @@ final class TStreamSampleBufferPlayer: NSObject {
     }
 
     private func configureAudioSession() {
-        #if os(iOS) || os(tvOS)
-        let session = AVAudioSession.sharedInstance()
-        try? session.setCategory(.playback, mode: .moviePlayback)
-        try? session.setActive(true)
-        #endif
+        TStreamAudioSession.activateForPlayback()
     }
 }
 
@@ -761,7 +775,12 @@ extension TStreamSampleBufferPlayer: MediaSourceDelegate {
         guard !stopped, !discardingUntilSeek, !videoSuspended else { return }
         pendingVideo.append(PendingVideo(data: data, codec: codec, pts: pts, dts: dts))
         pendingVideoBytes += data.count
+        if firstReceivedPTS == nil { firstReceivedPTS = pts }
+        latestReceivedPTS = max(latestReceivedPTS, pts)
         pumpDecode()
+        // Decoding stops `decodeAheadSeconds` in, so once the longer container
+        // preroll is in, nothing else would come back to start the clock.
+        startClockIfReady()
         updateBackpressure()
     }
 
